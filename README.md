@@ -241,3 +241,9 @@ Provider details live in `scalablerag/llm/factory.py`; regime and tool flags in 
 | `scripts/judge.py` | Score eval output |
 | `scripts/discover_patterns.py` | Pre-build patterns for limited-ingestion |
 | `scripts/build_embeddings.py` | Add embeddings to an existing index |
+
+## Legal Notices
+
+Every product name, logo, brand, and service name referenced in this software belongs to its respective owner and appears solely for identification. Cohesity is a registered trademark of Cohesity, Inc., and the open-source license agreement grants no right to use Cohesity's trademark.
+
+Disclaimer of Warranty: Cohesity furnishes no support or maintenance services for this software. Cohesity supplies the software (and each contributor supplies its respective contribution) on an "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, either expressed or implied, including but not limited to any warranties of TITLE, NONINFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A PARTICULAR PURPOSE. Deciding whether it is suitable to use or redistribute the software rests entirely with you. You bear any risks tied to your exercise of the permissions granted under the open-source license.
