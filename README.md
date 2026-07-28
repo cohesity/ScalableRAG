@@ -1,8 +1,21 @@
 # ScalableRAG
 
-ScalableRAG is a high-quality agentic retrieval system for question answering over text corpora that is capable of scaling to enormous corpora by limiting ingestion costs. The two main modes are **Zero-Ingestion ScalableRAG**, which has 0 LLM calls at ingestion and no vector database creation; and **Limited-Ingestion ScalableRAG**, which has a vector database and a number of LLM calls at ingestion that is constant as a function of the number of documents in the corpus.
+ScalableRAG (paper link) is a high-quality agentic retrieval system for question answering over text corpora that is capable of scaling to enormous corpora by limiting ingestion costs. The two main modes are **Zero-Ingestion ScalableRAG**, which has 0 ingestion (no LLM calls at ingestion and no vector database creation); and **Limited-Ingestion ScalableRAG**, which has a vector database and a number of LLM calls at ingestion that is constant as a function of the number of documents in the corpus.
 
-ScalableRAG is able to answer complex, multi-hop, and aggregative questions competitively with knowledge-graph based RAG systems by creating and maintaining persistent sets (of filenames, values, dates, strings, and lists of strings) at inference.
+On six diverse QA corpora, both ScalableRAG variants match or beat high-ingestion RAG systems, including knowledge-graph and schema-based approaches (GraphRAG, HippoRAG2, SRAG, AutoSchemaKG), despite requiring no preprocessing cost whatsoever. Zero-Ingestion ScalableRAG wins outright on three datasets (MuSiQue, Transcripts, Hotels) and just narrowly misses being the winner on the remaining three; across all six datasets it leads the next-best system (A-RAG) by **7.36 points** in LLM-as-judge accuracy (in %, using GPT-4.1):
+
+| System | MuSiQue | 2Wiki | Transcripts | FinanceBench | ComplexTR | Hotels | Average Across Datasets |
+|--------|---------|-------|-------------|--------------|-----------|--------|--------------|
+| **Limited-Ingestion ScalableRAG** | **58.91** | 86.76 | **83.50** | 75.58 | 75.57 | **73.15** | **75.58** |
+| **Zero-Ingestion ScalableRAG** | **58.09** | 85.74 | **82.00** | 76.31 | 78.84 | **71.74** | **75.45** |
+| A-RAG | 57.00 | **87.05** | 78.50 | **77.41** | 77.09 | 31.52 | 68.09 |
+| HippoRAG2 | 50.43 | 73.99 | 76.00 | 61.08 | **81.34** | 32.97 | 62.63 |
+| SRAG | 3.33 | 14.75 | 74.00 | 18.25 | 8.33 | 35.51 | 25.70 |
+| GraphRAG | 15.47 | 35.55 | 35.50 | 23.54 | 13.75 | 1.45 | 20.88 |
+| Vanilla RAG (top-100) | 38.49 | 43.80 | 71.00 | 32.09 | 77.59 | 30.80 | 48.96 |
+| AutoSchemaKG | — | — | — | — | 80.40 | 24.64 | — |
+
+ScalableRAG works by mimicking the logic an agent may apply to a structured data system such as a knowledge graph, but entirely at inference time. In order to do this it creates a workspace of persistent sets that it is able to interact with. This includes sets of filenames, sets of values, sets of strings, sets of dates, and sets of lists. The agent can create new sets from other sets through a series of tools: sets of files can be created through regex hits, sets of values extracted through regex value extraction, and so on. Each time a set is created, the agent sees a series of statistics; as well as scope checks to make sure it had created the correct set. Once the agent has created the relevant sets and validated them, aggregations are done automatically and shown to the agent. It is also capable of reading through docs in the created sets, doing set algebra, etc. It is this interaction of the agent with a workspace of agentic sets that makes ScalableRAG capable of inference-time aggregative logic as if it had access to a knowledge graph. See (paper link) for details.
 
 ---
 
