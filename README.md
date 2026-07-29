@@ -1,6 +1,6 @@
 # ScalableRAG
 
-ScalableRAG (paper link) is a high-quality agentic retrieval system for question answering over text corpora that is capable of scaling to enormous corpora by limiting ingestion costs. The two main modes are **Zero-Ingestion ScalableRAG**, which has 0 ingestion (no LLM calls at ingestion and no vector database creation); and **Limited-Ingestion ScalableRAG**, which has a vector database and a number of LLM calls at ingestion that is constant as a function of the number of documents in the corpus.
+ScalableRAG ([paper](https://arxiv.org/pdf/2607.25135)) is a high-quality agentic retrieval system for question answering over text corpora that is capable of scaling to enormous corpora by limiting ingestion costs. The two main modes are **Zero-Ingestion ScalableRAG**, which has 0 ingestion (no LLM calls at ingestion and no vector database creation); and **Limited-Ingestion ScalableRAG**, which has a vector database and a number of LLM calls at ingestion that is constant as a function of the number of documents in the corpus.
 
 On six diverse QA corpora, both ScalableRAG variants match or beat high-ingestion RAG systems, including knowledge-graph and schema-based approaches (GraphRAG, HippoRAG2, SRAG, AutoSchemaKG), despite requiring no preprocessing cost whatsoever. Zero-Ingestion ScalableRAG wins outright on three datasets (MuSiQue, Transcripts, Hotels) and just narrowly misses being the winner on the remaining three; across all six datasets it leads the next-best system (A-RAG) by **7.36 points** in LLM-as-judge accuracy (in %, using GPT-4.1):
 
@@ -15,7 +15,7 @@ On six diverse QA corpora, both ScalableRAG variants match or beat high-ingestio
 | Vanilla RAG (top-100) | 38.49 | 43.80 | 71.00 | 32.09 | 77.59 | 30.80 | 48.96 |
 | AutoSchemaKG | — | — | — | — | 80.40 | 24.64 | — |
 
-ScalableRAG works by mimicking the logic an agent may apply to a structured data system such as a knowledge graph, but entirely at inference time. In order to do this it creates a workspace of persistent sets that it is able to interact with. This includes sets of filenames, sets of values, sets of strings, sets of dates, and sets of lists. The agent can create new sets from other sets through a series of tools: sets of files can be created through regex hits, sets of values extracted through regex value extraction, and so on. Each time a set is created, the agent sees a series of statistics; as well as scope checks to make sure it had created the correct set. Once the agent has created the relevant sets and validated them, aggregations are done automatically and shown to the agent. It is also capable of reading through docs in the created sets, doing set algebra, etc. It is this interaction of the agent with a workspace of agentic sets that makes ScalableRAG capable of inference-time aggregative logic as if it had access to a knowledge graph. See (paper link) for details.
+ScalableRAG works by mimicking the logic an agent may apply to a structured data system such as a knowledge graph, but entirely at inference time. In order to do this it creates a workspace of persistent sets that it is able to interact with. This includes sets of filenames, sets of values, sets of strings, sets of dates, and sets of lists. The agent can create new sets from other sets through a series of tools: sets of files can be created through regex hits, sets of values extracted through regex value extraction, and so on. Each time a set is created, the agent sees a series of statistics; as well as scope checks to make sure it had created the correct set. Once the agent has created the relevant sets and validated them, aggregations are done automatically and shown to the agent. It is also capable of reading through docs in the created sets, doing set algebra, etc. It is this interaction of the agent with a workspace of agentic sets that makes ScalableRAG capable of inference-time aggregative logic as if it had access to a knowledge graph. See the [paper](https://arxiv.org/pdf/2607.25135) for details.
 
 ---
 
@@ -52,9 +52,18 @@ For a local GPU server instead, see "Other LLM backends" at the bottom.
 
 ---
 
-## 1. Add your documents
+## 1. Prepare a store (Zero-Ingestion)
 
-Plain text files in one folder:
+**Zero-Ingestion** means no LLM calls and no vector database at prepare time. Put plain `.txt` files in one folder and run `ingest.py` with `--no-embeddings`: it **copies your corpus into a store directory** (plus lightweight metadata) in the layout the agent reads from. Despite the script name, this step is file staging—not knowledge-graph or embedding ingestion.
+
+```bash
+python scripts/ingest.py \
+  --source /path/to/my_corpus \
+  --store  /path/to/my_store \
+  --no-embeddings
+```
+
+Your source folder looks like:
 
 ```
 my_corpus/
@@ -63,64 +72,56 @@ my_corpus/
   ...
 ```
 
-Useful filenames help (the agent can filter on them), but not necessary.
+Useful filenames help (the agent can filter on them), but are not required.
 
----
+The store directory looks like:
 
-## 2. Build an index
-
-### Zero-Ingestion (recommended starting point)
-
-This copies your files into an index directory the agent reads from.
-
-```bash
-python scripts/ingest.py \
-  --source /path/to/my_corpus \
-  --store  /path/to/my_index \
-  --no-embeddings
+```
+my_store/
+  docs/          # copied text + metadata
 ```
 
-### Limited-Ingestion
+### Limited-Ingestion (optional)
 
-Build embeddings at ingest (use the same provider/model when you query or eval):
+Same copy step, **plus** embeddings (and optionally pattern discovery). Use the same embed provider/model when you query or eval:
 
 ```bash
 # Local embeddings (free, default model)
 python scripts/ingest.py \
   --source /path/to/my_corpus \
-  --store  /path/to/my_index
+  --store  /path/to/my_store
 
 # Or OpenAI embeddings (matches paper limited-ingestion setup)
 python scripts/ingest.py \
   --source /path/to/my_corpus \
-  --store  /path/to/my_index \
+  --store  /path/to/my_store \
   --embed-provider openai \
   --embed-model text-embedding-3-small
 ```
 
-You get a directory like:
+Limited-ingestion adds:
 
 ```
-my_index/
-  docs/          # copied text + metadata
-  embeddings/    # only for limited-ingestion
+my_store/
+  docs/
+  embeddings/    # vector embeddings for semantic search
 ```
 
 ---
 
-## 3. Ask a question
+## 2. Ask a question
 
 ```bash
 # Zero-Ingestion
 python scripts/query.py \
   --regime zero \
-  --store /path/to/my_index \
+  --store /path/to/my_store \
   --question "How many documents mention clause 4.2?"
 
-# Limited-Ingestion (index must have embeddings from step 2)
+# Limited-Ingestion (store must have embeddings from step 1)
 python scripts/query.py \
   --regime limited \
-  --store /path/to/my_index \
+  --store /path/to/my_store \
   --question "How many documents mention clause 4.2?"
 ```
 
@@ -128,7 +129,7 @@ Add `--quiet` to print only the final answer.
 
 ---
 
-## 4. Run a benchmark (optional)
+## 3. Run a benchmark (optional)
 
 Questions file: JSONL with `question_id`, `question`, and `golden_answer` per line.
 
@@ -136,14 +137,14 @@ Questions file: JSONL with `question_id`, `question`, and `golden_answer` per li
 # Zero-Ingestion
 python scripts/eval.py \
   --regime zero \
-  --store /path/to/my_index \
+  --store /path/to/my_store \
   --questions /path/to/questions.jsonl \
   --output /path/to/results.jsonl
 
 # Limited-Ingestion
 python scripts/eval.py \
   --regime limited \
-  --store /path/to/my_index \
+  --store /path/to/my_store \
   --questions /path/to/questions.jsonl \
   --output /path/to/results.jsonl
 ```
@@ -156,16 +157,16 @@ Both regimes enable **aggregation tools** and **Branch-and-Select** by default. 
 
 ```bash
 python scripts/discover_patterns.py \
-  --store /path/to/my_index \
-  --output /path/to/my_index/patterns.json
-python scripts/eval.py --regime limited --store /path/to/my_index \
+  --store /path/to/my_store \
+  --output /path/to/my_store/patterns.json
+python scripts/eval.py --regime limited --store /path/to/my_store \
   --questions questions.jsonl --output results.jsonl \
-  --patterns /path/to/my_index/patterns.json
+  --patterns /path/to/my_store/patterns.json
 ```
 
 ---
 
-## 5. Score results
+## 4. Score results
 
 After eval, run LLM-as-judge scoring:
 
@@ -204,19 +205,19 @@ Writes `{stem}_judged.jsonl` (adds `answer_extracted` and a `judge` block with v
 | `--branch-select` | on | on |
 | Default embed model | — | `openai` / `text-embedding-3-small` |
 
-Use the same regime (or equivalent flags) at ingest, query, and eval time. If the index has no embeddings, query/eval must use `--regime zero` or `--no-embeddings`.
+Use the same regime (or equivalent flags) at prepare, query, and eval time. If the store has no embeddings, query/eval must use `--regime zero` or `--no-embeddings`.
 
 **Finer control:** skip `--regime` and set flags directly, for example:
 
 ```bash
 python scripts/eval.py \
-  --store /path/to/my_index \
+  --store /path/to/my_store \
   --questions questions.jsonl \
   --output results.jsonl \
   --no-embeddings \
   --agg-tools \
   --no-discover-patterns \
-  --patterns /path/to/my_index/patterns.json
+  --patterns /path/to/my_store/patterns.json
 ```
 
 Same boolean flags work on `query.py`. Ingest uses `--embeddings` / `--no-embeddings` plus `--embed-provider` and `--embed-model`.
@@ -248,12 +249,12 @@ Provider details live in `scalablerag/llm/factory.py`; regime and tool flags in 
 
 | Script | What it does |
 |--------|----------------|
-| `scripts/ingest.py` | Build index from a document folder |
+| `scripts/ingest.py` | Stage a corpus into a store (copy docs; optional embeddings) |
 | `scripts/query.py` | One question, interactive |
 | `scripts/eval.py` | Batch run over JSONL questions |
 | `scripts/judge.py` | Score eval output |
 | `scripts/discover_patterns.py` | Pre-build patterns for limited-ingestion |
-| `scripts/build_embeddings.py` | Add embeddings to an existing index |
+| `scripts/build_embeddings.py` | Add embeddings to an existing store |
 
 ## Legal Notices
 
