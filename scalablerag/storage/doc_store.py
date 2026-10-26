@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 
 @dataclass
@@ -33,6 +33,7 @@ class DocMeta:
     doc_id: str
     filename: str
     char_count: int = 0
+    byte_count: int = 0
     word_count: int = 0
     estimated_tokens: int = 0
     extra: dict = field(default_factory=dict)
@@ -124,6 +125,7 @@ class DocStore:
             doc_id=doc_id,
             filename=filename,
             char_count=len(text),
+            byte_count=len(text.encode("utf-8")),
             word_count=len(words),
             estimated_tokens=max(1, len(text) * 10 // 35),
             extra=extra or {},
@@ -136,6 +138,40 @@ class DocStore:
         self._meta[doc_id] = meta
         self._save_index()
         return meta
+
+    def add_documents(
+        self,
+        documents: Iterable[tuple[str, str, str, dict | None]],
+    ) -> list[DocMeta]:
+        """Add many documents while writing the metadata index only once.
+
+        ``add_document`` deliberately persists after every call, which is a
+        useful durability default for interactive updates but becomes
+        quadratic during a large corpus ingestion.  Bulk ingestion uses this
+        method so a million-document store performs one metadata-index write.
+        Each tuple is ``(doc_id, text, filename, extra)``.
+        """
+        self.init_store()
+        added: list[DocMeta] = []
+        for doc_id, text, filename, extra in documents:
+            words = text.split()
+            meta = DocMeta(
+                doc_id=doc_id,
+                filename=filename,
+                char_count=len(text),
+                byte_count=len(text.encode("utf-8")),
+                word_count=len(words),
+                estimated_tokens=max(1, len(text) * 10 // 35),
+                extra=extra or {},
+            )
+            (self.texts_dir / f"{doc_id}.txt").write_text(text, encoding="utf-8")
+            if doc_id not in self._meta:
+                self._doc_ids.append(doc_id)
+            self._meta[doc_id] = meta
+            added.append(meta)
+        self._save_index()
+        self._build_filename_index()
+        return added
 
     def get_text(self, doc_id: str) -> str:
         """Read document text. Raises KeyError if not found."""
@@ -162,6 +198,19 @@ class DocStore:
 
     def total_chars(self) -> int:
         return sum(m.char_count for m in self._meta.values())
+
+    def total_bytes(self) -> int:
+        """UTF-8 bytes in the corpus (falls back for pre-byte-count stores)."""
+        return sum(m.byte_count or m.char_count for m in self._meta.values())
+
+    def set_byte_size(self, doc_ids: list[str] | set[str]) -> int:
+        """Return corpus bytes represented by a document-id set without I/O."""
+        total = 0
+        for doc_id in doc_ids:
+            meta = self._meta.get(doc_id)
+            if meta is not None:
+                total += meta.byte_count or meta.char_count
+        return total
 
     def total_estimated_tokens(self) -> int:
         return sum(m.estimated_tokens for m in self._meta.values())

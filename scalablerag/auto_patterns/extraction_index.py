@@ -89,6 +89,10 @@ class PatternIndex:
     matching_doc_ids: list[str]
     total_docs: int
     unique_values: dict[str, list[str]]
+    # Captured groups keyed by document. New indexes persist these so
+    # pattern_search never has to rerun regex over a large active set.
+    # None denotes a legacy index that predates capture caching.
+    doc_extracts: dict[str, dict[str, str]] | None = None
     value_keywords: dict[str, list[str]] | None = None
     # Pre-computed gap analysis: for each value keyword, clusters of
     # docs where the keyword appears in the doc but NOT inside the
@@ -151,23 +155,40 @@ class ExtractionIndex:
         if not pi:
             return []
 
-        regex_str = pi.regex_template
-        try:
-            compiled = re.compile(regex_str, re.IGNORECASE | re.DOTALL)
-        except re.error:
-            return []
+        matching = pi.matching_doc_ids
+        if target_doc_ids is None:
+            candidates = matching
+        else:
+            target = set(target_doc_ids)
+            candidates = [doc_id for doc_id in matching if doc_id in target]
 
-        candidates = target_doc_ids or pi.matching_doc_ids
+        compiled = None
+        if pi.doc_extracts is None:
+            try:
+                compiled = re.compile(
+                    pi.regex_template, re.IGNORECASE | re.DOTALL
+                )
+            except re.error:
+                return []
+
         results = []
         for doc_id in candidates:
-            try:
-                text = doc_store.get_text(doc_id)
-            except KeyError:
-                continue
-            m = _safe_search(compiled, text)
-            if not m:
-                continue
-            groups = m.groupdict()
+            if pi.doc_extracts is not None:
+                groups = pi.doc_extracts.get(doc_id)
+                if groups is None:
+                    continue
+            else:
+                try:
+                    text = doc_store.get_text(doc_id)
+                except KeyError:
+                    continue
+                m = _safe_search(compiled, text)
+                if not m:
+                    continue
+                groups = {
+                    k: (v[:2000] if v else "")
+                    for k, v in m.groupdict().items()
+                }
             if params:
                 skip = False
                 for param_key, param_val in params.items():
@@ -177,7 +198,9 @@ class ExtractionIndex:
                         break
                 if skip:
                     continue
-            extract = {k: (v[:2000] if v else "") for k, v in groups.items()}
+            extract = {
+                k: (v[:2000] if v else "") for k, v in groups.items()
+            }
             meta = doc_store.get_meta(doc_id)
             results.append({
                 "doc_id": doc_id,
@@ -221,6 +244,8 @@ class ExtractionIndex:
                 d["value_keywords"] = pi.value_keywords
             if pi.keyword_gaps:
                 d["keyword_gaps"] = pi.keyword_gaps
+            if pi.doc_extracts is not None:
+                d["doc_extracts"] = pi.doc_extracts
             data["_patterns"][name] = d
         data["_filename_categories"] = self._filename_categories
         path.write_text(json.dumps(data, indent=2))
@@ -244,6 +269,8 @@ class ExtractionIndex:
                 d["value_keywords"] = None
             if "keyword_gaps" not in d:
                 d["keyword_gaps"] = None
+            if "doc_extracts" not in d:
+                d["doc_extracts"] = None
             d.pop("near_miss_doc_ids", None)
             d.pop("after_match_types", None)
             pi = PatternIndex(**d)
@@ -391,6 +418,8 @@ def build_extraction_index(
         print(f"Building extraction index: {len(templates)} patterns, "
               f"{total} docs")
 
+    packed_stream = hasattr(doc_store, "iter_texts")
+
     for ti, template in enumerate(templates):
         wildcard = template.instantiate()
         try:
@@ -402,20 +431,32 @@ def build_extraction_index(
             continue
 
         matching_ids: list[str] = []
+        doc_extracts: dict[str, dict[str, str]] = {}
         unique_vals: dict[str, set[str]] = defaultdict(set)
         val_kws: dict[str, set[str]] = defaultdict(set)
         t_start = time.time()
         skipped = False
 
-        for doc_id in all_ids:
-            try:
-                text = doc_store.get_text(doc_id)
-            except KeyError:
-                continue
+        if packed_stream:
+            text_rows = doc_store.iter_texts(all_ids)
+        else:
+            def _rows():
+                for current_id in all_ids:
+                    try:
+                        yield current_id, doc_store.get_text(current_id)
+                    except KeyError:
+                        continue
+            text_rows = _rows()
+
+        for doc_id, text in text_rows:
 
             m = _safe_search(compiled, text)
             if m:
                 matching_ids.append(doc_id)
+                doc_extracts[doc_id] = {
+                    k: (v.strip()[:2000] if v else "")
+                    for k, v in m.groupdict().items()
+                }
                 for k, v in m.groupdict().items():
                     if v and v.strip():
                         unique_vals[k].add(v.strip()[:80])
@@ -423,7 +464,8 @@ def build_extraction_index(
                             val_kws[k].add(tok.lower())
 
             elapsed = time.time() - t_start
-            if elapsed > _PER_PATTERN_TIME_BUDGET:
+            time_budget = 1800 if packed_stream else _PER_PATTERN_TIME_BUDGET
+            if elapsed > time_budget:
                 skipped = True
                 break
 
@@ -445,7 +487,11 @@ def build_extraction_index(
             all_kws.update(kw_set)
 
         keyword_gaps: dict[str, dict] = {}
-        if all_kws and matching_ids:
+        # Gap clustering is a pattern-development diagnostic.  Re-reading
+        # millions of matches is not required by inference and would add a
+        # second corpus pass per pattern, so perform it only on ordinary-size
+        # stores.
+        if all_kws and matching_ids and total < 100_000:
             kw_confirmed: dict[str, int] = defaultdict(int)
             kw_gap_lines: dict[str, list[tuple[str, str]]] = defaultdict(list)
 
@@ -501,6 +547,7 @@ def build_extraction_index(
             matching_doc_ids=matching_ids,
             total_docs=total,
             unique_values=sorted_vals,
+            doc_extracts=doc_extracts,
             value_keywords=sorted_kws,
             keyword_gaps=keyword_gaps if keyword_gaps else None,
         )
@@ -519,7 +566,10 @@ def build_extraction_index(
                   f"{len(sorted_vals)} extracted fields, "
                   f"{len(keyword_gaps)} keywords with gaps ({n_gaps} gap docs)")
 
-    fn_cats = _discover_filename_categories(doc_store, verbose=verbose)
+    fn_cats = (
+        _discover_filename_categories(doc_store, verbose=verbose)
+        if total < 100_000 else {}
+    )
     index._filename_categories = fn_cats
 
     if verbose:

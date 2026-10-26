@@ -1,19 +1,21 @@
 # ScalableRAG
 
-ScalableRAG ([paper](https://arxiv.org/pdf/2607.25135)) is a high-quality agentic retrieval system for question answering over text corpora that is capable of scaling to enormous corpora by limiting ingestion costs. The two main modes are **Zero-Ingestion ScalableRAG**, which has 0 ingestion (no LLM calls at ingestion and no vector database creation); and **Limited-Ingestion ScalableRAG**, which has a vector database and a number of LLM calls at ingestion that is constant as a function of the number of documents in the corpus.
+ScalableRAG ([paper](https://arxiv.org/pdf/2607.25135)) is a high-quality agentic retrieval system for question answering over text corpora that is capable of scaling to enormous corpora by limiting ingestion costs. The two main modes are **Zero-Ingestion ScalableRAG**, which has 0 ingestion (no LLM calls at ingestion and no vector database creation); and **Limited-Ingestion ScalableRAG**, which adds a local lexical index (and optionally vector embeddings via `--with-embeddings`) plus constant-size pattern discovery at query time.
 
-On six diverse QA corpora, both ScalableRAG variants match or beat high-ingestion RAG systems, including knowledge-graph and schema-based approaches (GraphRAG, HippoRAG2, SRAG, AutoSchemaKG), despite requiring no preprocessing cost whatsoever. Zero-Ingestion ScalableRAG wins outright on three datasets (MuSiQue, Transcripts, Hotels) and just narrowly misses being the winner on the remaining three; across all six datasets it leads the next-best system (A-RAG) by **7.36 points** in LLM-as-judge accuracy (in %, using GPT-4.1):
+On six QA corpora (with Hotels reported as **Hotels-50** and **Hotels-350** partitions), both ScalableRAG variants match or beat high-ingestion RAG systems, including knowledge-graph and schema-based approaches (GraphRAG, HippoRAG2, SRAG, AutoSchemaKG). Zero-Ingestion matches the strongest agentic baseline on conventional QA (**74.75** vs **74.64** mean judge score) and leads on aggregative Hotels-50 (**71.74** vs **31.52** for A-RAG). Numbers below are LLM-as-judge accuracy (%, GPT-4.1); see the [paper](https://arxiv.org/pdf/2607.25135) for confidence intervals and protocol details.
 
-| System | MuSiQue | 2Wiki | Transcripts | FinanceBench | ComplexTR | Hotels | Average Across Datasets |
-|--------|---------|-------|-------------|--------------|-----------|--------|--------------|
-| **Limited-Ingestion ScalableRAG** | **58.91** | 86.76 | **83.50** | 75.58 | 75.57 | **73.15** | **75.58** |
-| **Zero-Ingestion ScalableRAG** | **58.09** | 85.74 | **82.00** | 76.31 | 78.84 | **71.74** | **75.45** |
-| A-RAG | 57.00 | **87.05** | 78.50 | **77.41** | 77.09 | 31.52 | 68.09 |
-| HippoRAG2 | 50.43 | 73.99 | 76.00 | 61.08 | **81.34** | 32.97 | 62.63 |
-| SRAG | 3.33 | 14.75 | 74.00 | 18.25 | 8.33 | 35.51 | 25.70 |
-| GraphRAG | 15.47 | 35.55 | 35.50 | 23.54 | 13.75 | 1.45 | 20.88 |
-| Vanilla RAG (top-100) | 38.49 | 43.80 | 71.00 | 32.09 | 77.59 | 30.80 | 48.96 |
-| AutoSchemaKG | — | — | — | — | 80.40 | 24.64 | — |
+| System | MuSiQue | 2Wiki | Transcripts | FinanceBench | ComplexTR | Hotels-50 | Hotels-350 | Macro avg. |
+|--------|---------|-------|-------------|--------------|-----------|-----------|------------|------------|
+| **Limited-Ingestion ScalableRAG** | **58.91** | 86.76 | **83.50** | 75.58 | 75.57 | **73.15** | 62.44 | **73.70** |
+| **Zero-Ingestion ScalableRAG** | **58.09** | 85.74 | **82.00** | 76.31 | 78.84 | **71.74** | 55.96 | **72.67** |
+| A-RAG | 57.00 | **87.05** | 78.50 | **77.41** | 77.09 | 31.52 | 22.02 | 61.51 |
+| HippoRAG2 | 50.43 | 73.99 | 76.00 | 61.08 | **81.34** | 32.97 | 27.40 | 58.50 |
+| SRAG | 3.33 | 14.75 | 74.00 | 18.25 | 8.33 | 35.51 | 46.63 | 28.69 |
+| GraphRAG | 15.47 | 35.55 | 35.50 | 23.54 | 13.75 | 1.45 | 1.04 | 18.04 |
+| Vanilla RAG (top-100) | 38.49 | 43.80 | 71.00 | 32.09 | 77.59 | 30.80 | 13.99 | 43.97 |
+| AutoSchemaKG | — | — | — | — | 80.40 | 24.64 | 22.80 | — |
+
+Macro avg. is the **macro** GPT-4.1 judge aggregate over all seven partitions (Table 1 in the [paper](https://arxiv.org/pdf/2607.25135)). It matches the simple mean of the seven dataset columns for most systems, but not always (e.g. HippoRAG2: row mean ≈ 57.6 vs macro **58.50** in the table).
 
 ScalableRAG works by mimicking the logic an agent may apply to a structured data system such as a knowledge graph, but entirely at inference time. In order to do this it creates a workspace of persistent sets that it is able to interact with. This includes sets of filenames, sets of values, sets of strings, sets of dates, and sets of lists. The agent can create new sets from other sets through a series of tools: sets of files can be created through regex hits, sets of values extracted through regex value extraction, and so on. Each time a set is created, the agent sees a series of statistics; as well as scope checks to make sure it had created the correct set. Once the agent has created the relevant sets and validated them, aggregations are done automatically and shown to the agent. It is also capable of reading through docs in the created sets, doing set algebra, etc. It is this interaction of the agent with a workspace of agentic sets that makes ScalableRAG capable of inference-time aggregative logic as if it had access to a knowledge graph. See the [paper](https://arxiv.org/pdf/2607.25135) for details.
 
@@ -54,13 +56,13 @@ For a local GPU server instead, see "Other LLM backends" at the bottom.
 
 ## 1. Prepare a store (Zero-Ingestion)
 
-**Zero-Ingestion** means no LLM calls and no vector database at prepare time. Put plain `.txt` files in one folder and run `ingest.py` with `--no-embeddings`: it **copies your corpus into a store directory** (plus lightweight metadata) in the layout the agent reads from. Despite the script name, this step is file staging—not knowledge-graph or embedding ingestion.
+**Zero-Ingestion** means no LLM calls and no vector database at prepare time. Put plain `.txt` files in one folder and run `ingest.py` with `--no-lexical-index`: it **copies your corpus into a store directory** (plus lightweight metadata) in the layout the agent reads from. Despite the script name, this step is file staging—not knowledge-graph or embedding ingestion.
 
 ```bash
 python scripts/ingest.py \
   --source /path/to/my_corpus \
   --store  /path/to/my_store \
-  --no-embeddings
+  --no-lexical-index
 ```
 
 Your source folder looks like:
@@ -83,18 +85,19 @@ my_store/
 
 ### Limited-Ingestion (optional)
 
-Same copy step, **plus** embeddings (and optionally pattern discovery). Use the same embed provider/model when you query or eval:
+Same copy step, **plus** a lexical index (built by default). Add vector embeddings only if you want semantic search (`--with-embeddings` at ingest and again at query/eval):
 
 ```bash
-# Local embeddings (free, default model)
+# Lexical index only (default limited-ingestion store)
 python scripts/ingest.py \
   --source /path/to/my_corpus \
   --store  /path/to/my_store
 
-# Or OpenAI embeddings (matches paper limited-ingestion setup)
+# Optional: also build embeddings (use the same provider/model at query/eval)
 python scripts/ingest.py \
   --source /path/to/my_corpus \
   --store  /path/to/my_store \
+  --with-embeddings \
   --embed-provider openai \
   --embed-model text-embedding-3-small
 ```
@@ -104,7 +107,17 @@ Limited-ingestion adds:
 ```
 my_store/
   docs/
-  embeddings/    # vector embeddings for semantic search
+  lexical.sqlite3 # local SQLite FTS5 trigram index for scalable literal filtering
+  embeddings/     # optional; only with --with-embeddings at ingest
+```
+
+The lexical index is embedded and serverless: it uses SQLite FTS5 from
+Python's standard library, with no external vector or search service. Ingestion
+builds it by default for Limited-Ingestion stores. To add or rebuild it on an
+existing store:
+
+```bash
+python scripts/build_lexical_index.py --store /path/to/my_store
 ```
 
 ---
@@ -118,12 +131,27 @@ python scripts/query.py \
   --store /path/to/my_store \
   --question "How many documents mention clause 4.2?"
 
-# Limited-Ingestion (store must have embeddings from step 1)
+# Limited-Ingestion (store needs lexical.sqlite3 from step 1)
 python scripts/query.py \
   --regime limited \
   --store /path/to/my_store \
   --question "How many documents mention clause 4.2?"
+
+# Limited-Ingestion with semantic search (store must include embeddings)
+python scripts/query.py \
+  --regime limited \
+  --with-embeddings \
+  --store /path/to/my_store \
+  --question "How many documents mention clause 4.2?"
 ```
+
+Limited-Ingestion uses two filtering tiers. On a large active set, literal
+keywords and literal alternations are served by the local index; arbitrary
+regex is enabled after the active set falls below both 1,000 documents and
+10 MB. This keeps corpus-wide inference work bounded while preserving exact
+regex behavior on the narrowed set. Override the thresholds with
+`--tier-max-docs` and `--tier-max-bytes`, or use `--no-tiered-filters` for the
+legacy unrestricted behavior.
 
 Add `--quiet` to print only the final answer.
 
@@ -153,7 +181,7 @@ python scripts/eval.py \
 
 Eval resumes automatically if you re-run the same command; it skips questions already in the output file. Use `--start`, `--limit`, or `--max-steps` if you need finer control.
 
-Both regimes enable **aggregation tools** and **Branch-and-Select** by default. `--regime limited` additionally turns on **embeddings** (semantic search) and **pattern discovery/curation** during the run. You can also pre-build patterns offline:
+Both regimes enable **aggregation tools** and **Branch-and-Select** by default. `--regime limited` additionally turns on **tiered lexical filtering** and **pattern discovery/curation** during the run (embeddings only if you pass `--with-embeddings`). You can also pre-build patterns offline:
 
 ```bash
 python scripts/discover_patterns.py \
@@ -190,22 +218,23 @@ Writes `{stem}_judged.jsonl` (adds `answer_extracted` and a `judge` block with v
 
 **Ingest**
 
-| | `--regime zero` | `--regime limited` |
-|---|-----------------|---------------------|
-| Command | `ingest.py ... --no-embeddings` | `ingest.py ...` (with `--embed-provider openai --embed-model text-embedding-3-small` to match the preset defaults) |
+| | Zero-ingestion store | Limited-ingestion store |
+|---|----------------------|-------------------------|
+| Command | `ingest.py ... --no-lexical-index` | `ingest.py ...` (add `--with-embeddings` for vectors) |
 
 **Query / eval**
 
 | Flag | `--regime zero` | `--regime limited` |
 |------|-----------------|---------------------|
-| `--embeddings` | off (`--no-embeddings`) | on |
+| `--with-embeddings` | off | off (pass flag to enable) |
 | `--discover-patterns` | off | on |
 | `--curate-patterns` | off | on |
+| `--tiered-filters` | off | on (requires `lexical.sqlite3`) |
 | `--agg-tools` | on | on |
 | `--branch-select` | on | on |
-| Default embed model | — | `openai` / `text-embedding-3-small` |
+| Embed defaults when `--with-embeddings` | — | `openai` / `text-embedding-3-small` |
 
-Use the same regime (or equivalent flags) at prepare, query, and eval time. If the store has no embeddings, query/eval must use `--regime zero` or `--no-embeddings`.
+Use the same regime (or equivalent flags) at prepare, query, and eval time. Limited-ingestion requires a store with `lexical.sqlite3`; use `--with-embeddings` only when the store has embeddings.
 
 **Finer control:** skip `--regime` and set flags directly, for example:
 
@@ -214,13 +243,13 @@ python scripts/eval.py \
   --store /path/to/my_store \
   --questions questions.jsonl \
   --output results.jsonl \
-  --no-embeddings \
+  --tiered-filters \
   --agg-tools \
   --no-discover-patterns \
   --patterns /path/to/my_store/patterns.json
 ```
 
-Same boolean flags work on `query.py`. Ingest uses `--embeddings` / `--no-embeddings` plus `--embed-provider` and `--embed-model`.
+Same boolean flags work on `query.py`. Ingest uses `--with-embeddings` (opt-in) plus `--embed-provider` and `--embed-model`.
 
 ---
 
@@ -255,6 +284,7 @@ Provider details live in `scalablerag/llm/factory.py`; regime and tool flags in 
 | `scripts/judge.py` | Score eval output |
 | `scripts/discover_patterns.py` | Pre-build patterns for limited-ingestion |
 | `scripts/build_embeddings.py` | Add embeddings to an existing store |
+| `scripts/build_lexical_index.py` | Build/rebuild the local SQLite literal index |
 
 ## Legal Notices
 

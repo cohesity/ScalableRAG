@@ -36,6 +36,7 @@ Documents are chunked for small-context models; each chunk is scored independent
 from __future__ import annotations
 
 import json
+import hashlib
 import multiprocessing
 import random
 import re
@@ -196,6 +197,62 @@ _LABEL_FIELD_RE = re.compile(
     r"(\S[^\n]{0,300})",      # value: non-empty remainder of line
     re.MULTILINE | re.UNICODE,
 )
+
+_MARKDOWN_HEADING_RE = re.compile(
+    r"^(?P<marks>#{1,6})[ \t]+(?P<label>[^\n#].*?)[ \t]*$",
+    re.MULTILINE,
+)
+
+
+def _discover_markdown_sections(sample_docs: list[dict]) -> list[dict]:
+    """Find recurring Markdown sections without asking an LLM.
+
+    Discovery deliberately operates on the already bounded sample.  The
+    resulting regexes are later checked while building the extraction index.
+    This provides a deterministic path for corpora such as Hotels, whose
+    structure is explicit but does not use ``Label: Value`` fields.
+    """
+    from collections import Counter, defaultdict
+
+    counts: Counter[tuple[int, str]] = Counter()
+    display: dict[tuple[int, str], str] = {}
+    examples: dict[tuple[int, str], list[str]] = defaultdict(list)
+    for doc in sample_docs:
+        seen: set[tuple[int, str]] = set()
+        for match in _MARKDOWN_HEADING_RE.finditer(doc["text"]):
+            label = re.sub(r"\s+", " ", match.group("label")).strip()
+            key = (len(match.group("marks")), label.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            counts[key] += 1
+            display.setdefault(key, label)
+            if len(examples[key]) < 3:
+                examples[key].append(match.group(0))
+
+    candidates: list[dict] = []
+    for (level, normalized_label), count in counts.most_common():
+        if count < 3:
+            break
+        label = display[(level, normalized_label)]
+        safe_name = re.sub(r"[^a-z0-9]+", "_", label.casefold()).strip("_")
+        if not safe_name:
+            continue
+        candidates.append({
+            "name": f"section_{safe_name[:48]}",
+            "description": f"Extracts the recurring Markdown section '{label}'.",
+            "parameters": ["section"],
+            "regex_template": (
+                rf"(?:\A|\r?\n)\#{{{level}}}[ \t]+{re.escape(label)}[ \t]*\r?\n"
+                r"(?P<section>.{0,12000}?)(?=\r?\n#{1,6}[ \t]+|\Z)"
+            ),
+            "scope_regex": "",
+            "output_type": "extract",
+            "_sample_doc_count": count,
+            "_sample_size": len(sample_docs),
+            "_examples": examples[(level, normalized_label)],
+        })
+    return candidates
 
 
 def _discover_labeled_fields(doc_store: DocStore) -> list[dict]:
@@ -471,6 +528,7 @@ class PatternDiscovery:
         self.max_refinement_rounds = max_refinement_rounds
         self.target_precision = target_precision
         self.target_recall = target_recall
+        self.discovery_diagnostics: list[dict[str, Any]] = []
 
         ctx_tokens = self.llm.context_length
         self._ctx_chars = int(ctx_tokens * _chars_per_token())
@@ -494,7 +552,7 @@ class PatternDiscovery:
             )
 
         # Phase 1: sample and read documents
-        sample_ids = self._diverse_sample(self.sample_size)
+        sample_ids = self._diverse_sample(self.sample_size, seed=0)
         sample_docs = self._load_full_texts(sample_ids)
 
         if verbose:
@@ -509,6 +567,7 @@ class PatternDiscovery:
         if verbose:
             print("[discover] Scanning corpus for labeled fields...", flush=True)
         field_candidates = _discover_labeled_fields(self.doc_store)
+        section_candidates = _discover_markdown_sections(sample_docs)
         if verbose:
             print(
                 f"[discover] Found {len(field_candidates)} recurring labeled fields",
@@ -520,6 +579,11 @@ class PatternDiscovery:
                     f"— e.g. {(fc.get('_examples', [''])[0])[:80]}",
                     flush=True,
                 )
+            print(
+                f"[discover] Found {len(section_candidates)} recurring "
+                "Markdown sections",
+                flush=True,
+            )
 
         # Phase 2: LLM-driven pattern hypotheses
         if verbose:
@@ -533,16 +597,20 @@ class PatternDiscovery:
         # bugs to fix and no refinement needed.  Corpus statistics
         # (_doc_count, _value_variety) are already known.
         field_names: set[str] = set()
-        for fc in field_candidates:
+        deterministic_candidates = field_candidates + section_candidates
+        for fc in deterministic_candidates:
             template = self._raw_to_template(fc)
             if template is None:
                 continue
             n_docs = len(all_ids)
-            doc_count = fc.get("_doc_count", 0)
+            doc_count = fc.get("_doc_count", fc.get("_sample_doc_count", 0))
             variety = fc.get("_value_variety", 0)
             template.validation_score = 1.0
             template.validation_details = {
-                "source": "field_scanner",
+                "source": (
+                    "field_scanner" if "_doc_count" in fc
+                    else "markdown_section_scanner"
+                ),
                 "doc_count": doc_count,
                 "corpus_size": n_docs,
                 "value_variety": variety,
@@ -553,8 +621,8 @@ class PatternDiscovery:
 
         if verbose:
             print(
-                f"[discover] Accepted {len(field_names)} field-scanner "
-                f"patterns (deterministic, no LLM validation needed)",
+                f"[discover] Accepted {len(field_names)} deterministic "
+                f"patterns (no LLM validation needed)",
                 flush=True,
             )
 
@@ -1370,13 +1438,23 @@ class PatternDiscovery:
     # Document sampling and loading
     # ------------------------------------------------------------------
 
-    def _diverse_sample(self, n: int) -> list[str]:
-        """Sample doc IDs spread evenly across the corpus."""
+    def _diverse_sample(self, n: int, *, seed: int = 0) -> list[str]:
+        """Return a stable pseudo-random sample without periodic aliasing.
+
+        Even strides can repeatedly select the same source record in a
+        cyclic or otherwise periodic corpus.  Ranking IDs by a seeded hash
+        retains reproducibility while breaking that coupling.
+        """
         all_ids = self.doc_store.all_doc_ids()
         if len(all_ids) <= n:
             return list(all_ids)
-        step = max(1, len(all_ids) // n)
-        return [all_ids[i] for i in range(0, len(all_ids), step)][:n]
+        ranked = sorted(
+            all_ids,
+            key=lambda doc_id: hashlib.sha256(
+                f"{seed}\0{doc_id}".encode("utf-8")
+            ).digest(),
+        )
+        return ranked[:n]
 
     def _load_full_texts(self, doc_ids: list[str]) -> list[dict]:
         """Load documents — full text for large-ctx LLMs, multi-region
@@ -1455,7 +1533,7 @@ class PatternDiscovery:
 
         if verbose:
             print("  Round 2: extraction patterns (new sample)...", flush=True)
-        ids2 = self._diverse_sample(self.sample_size)
+        ids2 = self._diverse_sample(self.sample_size, seed=1)
         docs2 = self._load_full_texts(ids2)
         r2 = self._llm_discover_chunked(
             docs2, _DISCOVER_EXTRACTION, doc_char_budget, response_tokens,
@@ -1507,8 +1585,36 @@ class PatternDiscovery:
                     ),
                 },
             ]
-            resp = self.llm.complete_chat(messages, max_tokens=response_tokens)
-            batch = self._parse_json_array(resp)
+            batch: list[dict] = []
+            for attempt in range(1, 3):
+                resp = self.llm.complete_chat(
+                    messages, max_tokens=response_tokens
+                )
+                batch, parse_error = self._parse_json_array_detailed(resp)
+                self.discovery_diagnostics.append({
+                    "chunk": ci + 1,
+                    "chunk_count": len(chunks),
+                    "attempt": attempt,
+                    "parse_error": parse_error,
+                    "patterns": len(batch),
+                    "raw_response": resp,
+                })
+                if batch:
+                    break
+                if attempt == 1:
+                    messages = messages + [
+                        {"role": "assistant", "content": resp},
+                        {
+                            "role": "user",
+                            "content": (
+                                "The preceding response yielded no usable "
+                                "pattern objects. Re-check the documents and "
+                                "return one valid JSON array only. If there "
+                                "are recurring Markdown sections, include "
+                                "them."
+                            ),
+                        },
+                    ]
             accumulated.extend(batch)
             if verbose and len(chunks) > 1:
                 print(
@@ -1610,22 +1716,26 @@ class PatternDiscovery:
 
     @staticmethod
     def _parse_json_array(text: str) -> list[dict]:
+        parsed, _ = PatternDiscovery._parse_json_array_detailed(text)
+        return parsed
+
+    @staticmethod
+    def _parse_json_array_detailed(text: str) -> tuple[list[dict], str | None]:
         text = text.strip()
         start = text.find("[")
         if start == -1:
-            return []
-        depth = 0
-        for i, ch in enumerate(text[start:], start):
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start : i + 1])
-                    except json.JSONDecodeError:
-                        return []
-        return []
+            return [], "no JSON array found"
+        decoder = json.JSONDecoder()
+        try:
+            value, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError as exc:
+            return [], f"JSON decode error at {exc.pos}: {exc.msg}"
+        if not isinstance(value, list):
+            return [], f"decoded {type(value).__name__}, expected list"
+        objects = [item for item in value if isinstance(item, dict)]
+        if not objects:
+            return [], "valid array contained no pattern objects"
+        return objects, None
 
     @staticmethod
     def _parse_json_object(text: str) -> dict | None:

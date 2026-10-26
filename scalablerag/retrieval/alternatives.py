@@ -78,6 +78,11 @@ def _filename_search_counts(ctx: "ToolContext", args: dict) -> str:
 
     fn_results: list[tuple[str, int]] = []
     for word in unique_words[:3]:
+        if ctx.use_tiered_filters and ctx.lexical_index is not None and hasattr(ctx.lexical_index, "count_filenames"):
+            count = ctx.lexical_index.count_filenames(word)
+            if count > 0:
+                fn_results.append((word, count))
+            continue
         count = 0
         wl = word.lower()
         for _, meta in ctx.doc_store.iter_docs():

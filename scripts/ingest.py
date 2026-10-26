@@ -74,12 +74,26 @@ def main():
         "--batch-size", type=int, default=32, help="Embedding batch size"
     )
     parser.add_argument(
-        "--embeddings", action=argparse.BooleanOptionalAction, default=True,
+        "--with-embeddings",
+        action="store_true",
+        help="Build vector embeddings (off by default)",
+    )
+    parser.add_argument(
+        "--lexical-index",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Build the local SQLite FTS5 index used by tiered filtering. "
+            "Defaults to on."
+        ),
     )
 
     args = parser.parse_args()
 
-    skip_emb = not args.embeddings or os.environ.get("SR_NO_EMBEDDINGS") == "1"
+    skip_emb = not args.with_embeddings
+    build_lexical = (
+        args.lexical_index if args.lexical_index is not None else True
+    )
 
     embedder = None
     if not skip_emb:
@@ -95,7 +109,10 @@ def main():
         print("Embeddings DISABLED — docs only")
 
     ingester = CorpusIngester(
-        store_dir=args.store, embedder=embedder, k=args.k
+        store_dir=args.store,
+        embedder=embedder,
+        k=args.k,
+        build_lexical_index=build_lexical,
     )
 
     t0 = time.time()

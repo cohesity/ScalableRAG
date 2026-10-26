@@ -41,6 +41,7 @@ from scalablerag.storage.doc_store import DocStore
 from scalablerag.run_config import (
     detect_explicit_flags,
     load_embedding_setup,
+    load_lexical_setup,
     resolve_run_config,
 )
 from scalablerag.retrieval.agent import RetrievalAgent
@@ -64,15 +65,25 @@ def _trace_path(output_path: Path) -> Path:
 
 
 def main():
+    run_started = time.perf_counter()
     parser = argparse.ArgumentParser(description="Evaluate retrieval agent")
     parser.add_argument("--store", required=True, help="Indexed corpus path")
+    parser.add_argument(
+        "--packed-database",
+        default=None,
+        help="Optional packed SQLite corpus (see scalablerag.storage.packed_store)",
+    )
+    parser.add_argument(
+        "--corpus-limit", type=int, default=None,
+        help="Prefix size to expose from --packed-database",
+    )
     parser.add_argument("--questions", required=True, help="questions.jsonl")
     parser.add_argument("--output", default="results.jsonl", help="Output file")
     parser.add_argument(
         "--regime",
         choices=["zero", "limited"],
         default=None,
-        help="zero or limited (sets embeddings, patterns, agg, BaS)",
+        help="zero or limited (tiered index, patterns, agg, BaS; embeddings opt-in)",
     )
     parser.add_argument("--llm-provider", default=None)
     parser.add_argument("--llm-model", default=None)
@@ -81,7 +92,9 @@ def main():
     parser.add_argument("--embed-dir", default=None,
                         help="Embedding subdirectory name (e.g. embeddings__hf__all-MiniLM-L6-v2)")
     parser.add_argument(
-        "--embeddings", action=argparse.BooleanOptionalAction,
+        "--with-embeddings",
+        action="store_true",
+        help="Load vector embeddings for semantic search (off by default)",
     )
     parser.add_argument("--patterns", default=None,
                         help="Path to pattern library JSON (from discover_patterns.py)")
@@ -104,6 +117,13 @@ def main():
     parser.add_argument(
         "--branch-select", action=argparse.BooleanOptionalAction,
     )
+    parser.add_argument(
+        "--tiered-filters", action=argparse.BooleanOptionalAction,
+        help="Use indexed literals on large sets and exact regex on small sets",
+    )
+    parser.add_argument("--tier-max-bytes", type=int, default=None)
+    parser.add_argument("--tier-max-docs", type=int, default=None)
+    parser.add_argument("--tier-max-results", type=int, default=None)
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -121,7 +141,31 @@ def main():
 
     store_path = Path(args.store)
     print("Loading corpus...")
-    doc_store = DocStore(store_path / "docs")
+    if args.packed_database:
+        if not args.corpus_limit:
+            print("ERROR: --packed-database requires --corpus-limit")
+            sys.exit(1)
+        from scalablerag.storage.packed_store import (
+            PackedDocStore,
+            PackedLexicalIndex,
+        )
+        doc_store = PackedDocStore(args.packed_database, args.corpus_limit)
+        lexical_index = (
+            PackedLexicalIndex(args.packed_database, args.corpus_limit)
+            if cfg.require_lexical_index else None
+        )
+        if lexical_index is not None:
+            lexical_index.validate(doc_store)
+    else:
+        doc_store = DocStore(store_path / "docs")
+        try:
+            lexical_index = (
+                load_lexical_setup(store_path, doc_store, required=True)
+                if cfg.require_lexical_index else None
+            )
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
 
     embedding_store = None
     embedder = None
@@ -178,6 +222,11 @@ def main():
         discovery = PatternDiscovery(llm=llm, doc_store=doc_store)
         pattern_library = discovery.discover(verbose=args.verbose)
         out_path = store_path / "patterns.json"
+        diagnostics_path = store_path / "patterns.discovery.json"
+        diagnostics_path.write_text(
+            json.dumps(discovery.discovery_diagnostics, indent=2) + "\n",
+            encoding="utf-8",
+        )
         # Remove stale sidecar files from a prior discovery run.
         for stale in (
             out_path.with_suffix(".extraction.json"),
@@ -189,6 +238,7 @@ def main():
         pattern_library.save(out_path)
         patterns_path = str(out_path)
         print(f"  Saved patterns to {out_path}")
+        print(f"  Saved discovery diagnostics to {diagnostics_path}")
     elif patterns_path:
         from scalablerag.auto_patterns.patterns import PatternLibrary
         ppath = Path(patterns_path)
@@ -278,11 +328,17 @@ def main():
 
         idx_path = Path(patterns_path).with_suffix(".extraction.json") if patterns_path else None
 
-        # Determine which pattern names the index MUST contain.
+        # Only concrete regex templates can appear in an extraction index.
+        # Curation may also retain semantic gap concepts, which are useful to
+        # the agent prompt but have no template to precompute.
+        _library_names = {t.name for t in pattern_library.all_templates()}
         if curation_result and curation_result.kept:
-            _expected_names = {s.name for s in curation_result.kept}
+            _expected_names = {
+                s.name for s in curation_result.kept
+                if s.name in _library_names
+            }
         else:
-            _expected_names = {t.name for t in pattern_library.all_templates()}
+            _expected_names = _library_names
 
         if idx_path and idx_path.exists():
             print("Loading pre-computed extraction index...")
@@ -341,7 +397,15 @@ def main():
         extraction_index=extraction_index,
         curation_result=curation_result,
         use_agg_tools=cfg.use_agg_tools,
+        lexical_index=lexical_index,
+        use_tiered_filters=cfg.use_tiered_filters,
+        tier_max_bytes=cfg.tier_max_bytes,
+        tier_max_docs=cfg.tier_max_docs,
+        tier_max_results=cfg.tier_max_results,
     )
+
+    preprocessing_elapsed_s = time.perf_counter() - run_started
+    question_loop_started = time.perf_counter()
 
     questions = load_questions(args.questions)
     print(f"\nLoaded {len(questions)} questions")
@@ -389,6 +453,9 @@ def main():
         print(f"  Golden: {golden[:200]}")
         print("=" * 70)
 
+        tokens_before = int(
+            getattr(getattr(llm, "_budget", None), "used_tokens", 0)
+        )
         try:
             result = agent.query(question, verbose=args.verbose)
         except Exception as e:
@@ -400,6 +467,10 @@ def main():
                 "trace": [],
                 "elapsed_s": 0,
             }
+        tokens_after = int(
+            getattr(getattr(llm, "_budget", None), "used_tokens", 0)
+        )
+        llm_tokens = max(0, tokens_after - tokens_before)
 
         answer_raw = result.get("answer", "")
         n_steps = result.get("steps", 0)
@@ -419,6 +490,16 @@ def main():
                 entry["result_preview"] = t["result"][:1000]
                 if len(t["result"]) > 1000:
                     entry["truncated"] = True
+            if "tool_elapsed_s" in t:
+                entry["tool_elapsed_s"] = t["tool_elapsed_s"]
+            if "llm_elapsed_s" in t:
+                entry["llm_elapsed_s"] = t["llm_elapsed_s"]
+            if "branch_llm_elapsed_s" in t:
+                entry["branch_llm_elapsed_s"] = t["branch_llm_elapsed_s"]
+            if "branch_preview_elapsed_s" in t:
+                entry["branch_preview_elapsed_s"] = t["branch_preview_elapsed_s"]
+            if "phase_elapsed_s" in t:
+                entry["phase_elapsed_s"] = t["phase_elapsed_s"]
             if t.get("branch"):
                 entry["branch"] = t["branch"]
             if t.get("original_proposal"):
@@ -439,6 +520,7 @@ def main():
             "golden_answer": golden,
             "answer_raw": answer_raw,
             "elapsed_s": elapsed,
+            "llm_tokens": llm_tokens,
             "agent_trace": agent_trace,
         }
         with open(output_path, "a", encoding="utf-8") as f:
@@ -488,6 +570,11 @@ def main():
         print(f"Total time: {total_time:.1f}s")
         print(f"Avg time: {total_time/max(1,n):.1f}s")
         print(f"Avg steps: {total_steps/max(1,n):.1f}")
+        total_llm_tokens = sum(int(r.get("llm_tokens", 0)) for r in results)
+        print(
+            f"LLM tokens: {total_llm_tokens} total, "
+            f"{total_llm_tokens/max(1,n):.1f} avg"
+        )
         print(f"Forced answers: {forced}")
 
         by_type: dict[str, list] = {}
@@ -506,6 +593,28 @@ def main():
 
     print(f"\nResults: {output_path}")
     print(f"Traces:  {trace_output}")
+    run_metrics = {
+        "regime": cfg.regime,
+        "documents": doc_store.doc_count(),
+        "corpus_bytes": doc_store.total_bytes(),
+        "preprocessing_elapsed_s": round(preprocessing_elapsed_s, 6),
+        "question_loop_wall_s": round(
+            time.perf_counter() - question_loop_started, 6
+        ),
+        "run_wall_s": round(time.perf_counter() - run_started, 6),
+        "result_questions": len(results) if output_path.exists() else 0,
+    }
+    if hasattr(doc_store, "text_cache_build_s"):
+        run_metrics["zero_runtime_text_cache_build_s"] = round(
+            float(doc_store.text_cache_build_s), 6
+        )
+    if hasattr(doc_store, "normalized_text_cache_build_s"):
+        run_metrics["zero_runtime_normalized_cache_build_s"] = round(
+            float(doc_store.normalized_text_cache_build_s), 6
+        )
+    run_metrics_path = output_path.with_name(output_path.stem + "_run.json")
+    run_metrics_path.write_text(json.dumps(run_metrics, indent=2) + "\n")
+    print(f"Run metrics: {run_metrics_path}")
 
 
 if __name__ == "__main__":

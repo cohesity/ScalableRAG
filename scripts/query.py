@@ -43,6 +43,7 @@ from scalablerag.storage.doc_store import DocStore
 from scalablerag.run_config import (
     detect_explicit_flags,
     load_embedding_setup,
+    load_lexical_setup,
     resolve_run_config,
 )
 from scalablerag.retrieval.agent import RetrievalAgent
@@ -79,7 +80,9 @@ def main():
         help="Embedding subdirectory name (e.g. embeddings__openai__text-embedding-3-small)",
     )
     parser.add_argument(
-        "--embeddings", action=argparse.BooleanOptionalAction,
+        "--with-embeddings",
+        action="store_true",
+        help="Load vector embeddings for semantic search (off by default)",
     )
     parser.add_argument(
         "--agg-tools", action=argparse.BooleanOptionalAction,
@@ -87,6 +90,13 @@ def main():
     parser.add_argument(
         "--branch-select", action=argparse.BooleanOptionalAction,
     )
+    parser.add_argument(
+        "--tiered-filters", action=argparse.BooleanOptionalAction,
+        help="Use indexed literals on large sets and exact regex on small sets",
+    )
+    parser.add_argument("--tier-max-bytes", type=int, default=None)
+    parser.add_argument("--tier-max-docs", type=int, default=None)
+    parser.add_argument("--tier-max-results", type=int, default=None)
     parser.add_argument(
         "--max-steps", type=int, default=25, help="Max agent steps"
     )
@@ -104,6 +114,15 @@ def main():
 
     print("Loading corpus...")
     doc_store = DocStore(store_path / "docs")
+    try:
+        lexical_index = load_lexical_setup(
+            store_path,
+            doc_store,
+            required=cfg.require_lexical_index,
+        )
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
 
     embedding_store = None
     embedder = None
@@ -143,6 +162,11 @@ def main():
         use_embeddings=use_embeddings,
         branch_select=cfg.branch_select,
         use_agg_tools=cfg.use_agg_tools,
+        lexical_index=lexical_index,
+        use_tiered_filters=cfg.use_tiered_filters,
+        tier_max_bytes=cfg.tier_max_bytes,
+        tier_max_docs=cfg.tier_max_docs,
+        tier_max_results=cfg.tier_max_results,
     )
 
     print(f"\nQuestion: {args.question}\n")

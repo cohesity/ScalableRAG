@@ -27,6 +27,7 @@ import numpy as np
 from ..llm.base import BaseEmbedder
 from ..storage.doc_store import DocStore
 from ..storage.embedding_store import EmbeddingStore
+from ..storage.lexical_index import LexicalIndex
 
 
 def _make_doc_id(filename: str) -> str:
@@ -115,10 +116,12 @@ class CorpusIngester:
         store_dir: str | Path,
         embedder: BaseEmbedder | None,
         k: int = 1,
+        build_lexical_index: bool = False,
     ):
         self.store_dir = Path(store_dir)
         self.embedder = embedder
         self.k = k
+        self.build_lexical_index = build_lexical_index
         self.doc_store = DocStore(self.store_dir / "docs")
         self.embedding_store = (
             EmbeddingStore(self.store_dir / "embeddings")
@@ -138,16 +141,18 @@ class CorpusIngester:
         raw_docs = load_corpus_from_directory(source_dir, extensions)
         print(f"[ingest] Found {len(raw_docs)} documents in {source_dir}")
 
-        doc_ids: list[str] = []
-        for filepath, filename, text in raw_docs:
-            doc_id = _make_doc_id(filename)
-            self.doc_store.add_document(
-                doc_id=doc_id,
-                text=text,
-                filename=filename,
-                extra={"source_path": filepath},
+        doc_ids = [_make_doc_id(filename) for _, filename, _ in raw_docs]
+        self.doc_store.add_documents(
+            (
+                (doc_id, text, filename, {"source_path": filepath})
+                for doc_id, (filepath, filename, text) in zip(doc_ids, raw_docs)
             )
-            doc_ids.append(doc_id)
+        )
+
+        lexical_index = None
+        if self.build_lexical_index:
+            print(f"[ingest] Building SQLite FTS5 lexical index for {len(doc_ids)} docs...")
+            lexical_index = LexicalIndex.build(self.store_dir, self.doc_store)
 
         if self.embedder is None or self.embedding_store is None:
             stats = {
@@ -157,6 +162,7 @@ class CorpusIngester:
                 "auto_promoted_count": 0,
                 "total_chars": self.doc_store.total_chars(),
                 "total_estimated_tokens": self.doc_store.total_estimated_tokens(),
+                "lexical_index": str(lexical_index.path) if lexical_index else "",
             }
             print(f"[ingest] Done (docs only). {len(doc_ids)} docs")
             return stats
@@ -236,6 +242,7 @@ class CorpusIngester:
             "auto_promoted_files": auto_promoted,
             "total_chars": self.doc_store.total_chars(),
             "total_estimated_tokens": self.doc_store.total_estimated_tokens(),
+            "lexical_index": str(lexical_index.path) if lexical_index else "",
         }
         print(
             f"[ingest] Done. {stats['total_docs']} docs, "

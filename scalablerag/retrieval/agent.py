@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 from ..llm.base import BaseLLM, BaseEmbedder
 from ..storage.doc_store import DocStore
 from ..storage.embedding_store import EmbeddingStore
+from ..storage.lexical_index import LexicalIndex
 from .tools import ToolContext, execute_tool, get_tool_registry, EMBEDDING_TOOLS
 from .branching import (
     DETERMINISTIC_TOOLS,
@@ -103,6 +104,17 @@ the actual format you observed — anchor to structural markers \
 (section headings, field labels), not bare keywords.  Apply WITHIN \
 your working set.  If the negative set has docs in a different \
 format, build a separate filter and UNION.
+
+<<IF:tiered_filters>>
+SCALING CONTRACT. On a large working set, apply_filter is index-backed \
+and accepts only a literal keyword or a literal alternation such as \
+term_a|term_b. Complex regexes (.*, anchors, groups, character classes) \
+are available only after the working set is small. If a complex filter \
+is refused, first narrow with a selective literal, search_filenames, or \
+set intersection, then retry the complex regex on that smaller set. \
+An unconfirmed indexed result is a broad candidate set, not a final set \
+for counting; narrow it until exact confirmation is reported.
+<<ENDIF:tiered_filters>>
 
 <<IF:agg_tools>>
 4. NUMERICAL AGGREGATION.  For questions asking for average, sum, \
@@ -539,6 +551,7 @@ def _extract_structural_summary(content: str) -> str | None:
         "value_set", "extracted", "scanned", "preview",
         "result", "n_values", "matching_docs", "created_set",
         "matched", "total_in_value_set",
+        "filter_execution",
     }
     summary = {k: v for k, v in obj.items() if k in keep_keys}
     if not summary:
@@ -690,6 +703,7 @@ def _question_landscape(
     question: str,
     doc_store: "DocStore",
     extraction_index: "ExtractionIndex | None" = None,
+    lexical_index: "LexicalIndex | None" = None,
 ) -> tuple[str, list[str], dict[str, set[str]]]:
     """Keyword counts and samples before the first tool call.
 
@@ -712,20 +726,35 @@ def _question_landscape(
     best_first_id: str | None = None
     all_kw_sets: dict[str, set[str]] = {}
 
+    bulk_landscape = None
+    if lexical_index is None and hasattr(doc_store, "keyword_landscape"):
+        bulk_landscape = doc_store.keyword_landscape(tokens[:5])
+
     for tok in tokens[:5]:
         tok_lower = tok.lower()
         doc_set: set[str] = set()
         first_id: str | None = None
-        for did in all_ids:
-            try:
-                text = doc_store.get_text(did)
-                if tok_lower in text.lower():
-                    doc_set.add(did)
-                    if first_id is None:
-                        first_id = did
-            except KeyError:
-                pass
-        count = len(doc_set)
+        if lexical_index is not None and len(tok) >= 3:
+            count = lexical_index.count_any([tok])
+            matches = lexical_index.search_any([tok], limit=16_384)
+            if not matches.truncated:
+                doc_set.update(matches.doc_ids)
+            if matches.doc_ids:
+                first_id = matches.doc_ids[0]
+        elif bulk_landscape is not None:
+            count, first_id, materialized = bulk_landscape[tok]
+            doc_set.update(materialized)
+        else:
+            for did in all_ids:
+                try:
+                    text = doc_store.get_text(did)
+                    if tok_lower in text.lower():
+                        doc_set.add(did)
+                        if first_id is None:
+                            first_id = did
+                except KeyError:
+                    pass
+            count = len(doc_set)
         all_kw_sets[tok] = doc_set
         results.append((tok, count, first_id))
         if 0 < count < best_count:
@@ -735,16 +764,25 @@ def _question_landscape(
 
     # Filename match counts — cheap, enables agent to pick the right tool.
     fname_counts: dict[str, int] = {}
-    for tok, _, _ in results:
-        tok_lower = tok.lower()
-        cnt = 0
-        for did in all_ids:
-            try:
-                if tok_lower in doc_store.get_meta(did).filename.lower():
-                    cnt += 1
-            except KeyError:
-                pass
-        fname_counts[tok] = cnt
+    # At multi-million-document scale the title is already part of the
+    # indexed/searchable body.  A second full metadata pass adds substantial
+    # latency without changing retrieval, so retain this diagnostic only for
+    # ordinary-sized stores.
+    if total <= 100_000:
+        result_tokens = [tok for tok, _, _ in results]
+        if hasattr(doc_store, "filename_landscape"):
+            fname_counts = doc_store.filename_landscape(result_tokens)
+        else:
+            for tok in result_tokens:
+                tok_lower = tok.lower()
+                cnt = 0
+                for did in all_ids:
+                    try:
+                        if tok_lower in doc_store.get_meta(did).filename.lower():
+                            cnt += 1
+                    except KeyError:
+                        pass
+                fname_counts[tok] = cnt
 
     lines = ["\n[Auto-landscape — keyword preview only, you MUST use tools to search and verify]"]
     for tok, count, _ in results:
@@ -1025,6 +1063,11 @@ class RetrievalAgent:
         extraction_index: "ExtractionIndex | None" = None,
         curation_result: "CurationResult | None" = None,
         use_agg_tools: bool = False,
+        lexical_index: LexicalIndex | None = None,
+        use_tiered_filters: bool = False,
+        tier_max_bytes: int = 10_000_000,
+        tier_max_docs: int = 1_000,
+        tier_max_results: int = 16_384,
     ):
         self.llm = llm
         self.doc_store = doc_store
@@ -1038,6 +1081,11 @@ class RetrievalAgent:
         self.extraction_index = extraction_index
         self.curation_result = curation_result
         self.use_agg_tools = use_agg_tools
+        self.lexical_index = lexical_index
+        self.use_tiered_filters = use_tiered_filters
+        self.tier_max_bytes = tier_max_bytes
+        self.tier_max_docs = tier_max_docs
+        self.tier_max_results = tier_max_results
 
         ctx_len = llm.context_length
         if max_tool_result_chars > 0:
@@ -1073,6 +1121,11 @@ class RetrievalAgent:
             disabled_tools=self.disabled_tools,
             extraction_index=self.extraction_index,
             use_agg_tools=self.use_agg_tools,
+            lexical_index=self.lexical_index,
+            use_tiered_filters=self.use_tiered_filters,
+            tier_max_bytes=self.tier_max_bytes,
+            tier_max_docs=self.tier_max_docs,
+            tier_max_results=self.tier_max_results,
         )
         ctx.user_question = question
 
@@ -1095,13 +1148,20 @@ class RetrievalAgent:
             remove_sections.add("pattern_search")
         if not self.use_agg_tools:
             remove_sections.add("agg_tools")
+        if not self.use_tiered_filters:
+            remove_sections.add("tiered_filters")
         sys_prompt = _strip_sections(sys_prompt, remove_sections)
         if self.disabled_tools:
             sys_prompt = _strip_disabled_tool_sections(sys_prompt, self.disabled_tools)
 
+        landscape_started = time.perf_counter()
         landscape_text, entity_kws, kw_doc_sets = _question_landscape(
-            question, self.doc_store, self.extraction_index
+            question,
+            self.doc_store,
+            self.extraction_index,
+            self.lexical_index if self.use_tiered_filters else None,
         )
+        landscape_elapsed_s = time.perf_counter() - landscape_started
         ctx.question_entities = entity_kws
         ctx.keyword_doc_sets = kw_doc_sets
 
@@ -1131,7 +1191,12 @@ class RetrievalAgent:
         ]
 
         tool_log: list[dict] = []
-        trace: list[dict] = []
+        trace: list[dict] = [{
+            "step": 0,
+            "timestamp": time.time(),
+            "event": "question_landscape",
+            "phase_elapsed_s": round(landscape_elapsed_s, 6),
+        }]
         _content_filter_recoveries = 0
 
         for step in range(1, self.max_steps + 1):
@@ -1149,6 +1214,7 @@ class RetrievalAgent:
                     f"(avail_tokens={avail}, conv={conv_chars:,} chars) ---"
                 )
 
+            llm_started = time.perf_counter()
             try:
                 resp_text = self.llm.complete_chat(messages, max_tokens=avail)
             except ContentFilterError:
@@ -1199,6 +1265,7 @@ class RetrievalAgent:
                     {"thought": f"LLM error: {e}",
                      "answer": "Unable to complete due to LLM error."}
                 )
+            llm_elapsed_s = time.perf_counter() - llm_started
 
             parsed = _parse_agent_json(resp_text)
             if parsed is None:
@@ -1209,6 +1276,7 @@ class RetrievalAgent:
                     "timestamp": time.time(),
                     "event": "parse_error",
                     "raw_response": resp_text[:2000],
+                    "llm_elapsed_s": round(llm_elapsed_s, 6),
                 })
                 messages.append({"role": "assistant", "content": resp_text})
                 messages.append(
@@ -1267,6 +1335,7 @@ class RetrievalAgent:
                         "timestamp": time.time(),
                         "event": "pushback_zero_retrieval",
                         "attempted_answer": answer,
+                        "llm_elapsed_s": round(llm_elapsed_s, 6),
                     })
                     messages.append(
                         {"role": "assistant", "content": resp_text}
@@ -1344,6 +1413,7 @@ class RetrievalAgent:
                         "timestamp": time.time(),
                         "event": "pushback",
                         "attempted_answer": answer,
+                        "llm_elapsed_s": round(llm_elapsed_s, 6),
                     })
                     messages.append(
                         {"role": "assistant", "content": resp_text}
@@ -1361,6 +1431,7 @@ class RetrievalAgent:
                     "event": "answer",
                     "thought": thought,
                     "answer": answer,
+                    "llm_elapsed_s": round(llm_elapsed_s, 6),
                 })
                 return {
                     "answer": answer,
@@ -1394,6 +1465,7 @@ class RetrievalAgent:
                         "step": step, "timestamp": time.time(),
                         "event": "answer", "thought": thought,
                         "answer": str(answer_text),
+                        "llm_elapsed_s": round(llm_elapsed_s, 6),
                     })
                     # Route through the same interceptors as a normal answer
                     # by injecting as a proper answer and re-processing.
@@ -1477,6 +1549,7 @@ class RetrievalAgent:
             if (self.branch_select
                     and tool_name in DETERMINISTIC_TOOLS
                     and tool_name != "count_set"):
+                branch_preview_started = time.perf_counter()
                 proposed_preview = preview_action(ctx, tool_name, tool_args)
 
                 # Threshold-based BaS: only branch when proposal looks
@@ -1491,6 +1564,9 @@ class RetrievalAgent:
                 alternatives = (
                     generate_alternatives(ctx, tool_name, tool_args)
                     if should_branch else []
+                )
+                branch_preview_elapsed_s = (
+                    time.perf_counter() - branch_preview_started
                 )
 
                 if alternatives:
@@ -1509,12 +1585,16 @@ class RetrievalAgent:
                     })
 
                     sel_avail = self._safe_max_tokens(messages, desired=2000)
+                    branch_llm_started = time.perf_counter()
                     try:
                         sel_resp = self.llm.complete_chat(
                             messages, max_tokens=sel_avail,
                         )
                     except Exception as e:
                         sel_resp = '{"selection": 1}'
+                    branch_llm_elapsed_s = (
+                        time.perf_counter() - branch_llm_started
+                    )
 
                     sel_parsed = _parse_agent_json(sel_resp)
                     if sel_parsed and "selection" in sel_parsed:
@@ -1550,7 +1630,9 @@ class RetrievalAgent:
                     messages.pop()  # remove branch prompt
                     messages.pop()  # remove assistant msg (will re-add below)
 
+            tool_started = time.perf_counter()
             result = execute_tool(ctx, selected_tool, selected_args)
+            tool_elapsed_s = time.perf_counter() - tool_started
 
             if verbose:
                 preview = result[:300].replace("\n", " ")
@@ -1565,9 +1647,20 @@ class RetrievalAgent:
                 "args": selected_args,
                 "result": result,
                 "result_chars": len(result),
+                "tool_elapsed_s": round(tool_elapsed_s, 6),
+                "llm_elapsed_s": round(llm_elapsed_s, 6),
             }
             if branch_info:
                 trace_entry["branch"] = branch_info
+                trace_entry["branch_llm_elapsed_s"] = round(
+                    branch_llm_elapsed_s, 6
+                )
+            if (self.branch_select
+                    and tool_name in DETERMINISTIC_TOOLS
+                    and tool_name != "count_set"):
+                trace_entry["branch_preview_elapsed_s"] = round(
+                    branch_preview_elapsed_s, 6
+                )
                 if selected_tool != tool_name or selected_args != tool_args:
                     trace_entry["original_proposal"] = {
                         "tool": tool_name, "args": tool_args,
@@ -1579,6 +1672,7 @@ class RetrievalAgent:
                 "tool": selected_tool,
                 "args": selected_args,
                 "result_chars": len(result),
+                "tool_elapsed_s": round(tool_elapsed_s, 6),
             })
 
             # Build the assistant message — if branch changed the action,
@@ -1622,6 +1716,7 @@ class RetrievalAgent:
                 ),
             }
         )
+        forced_llm_started = time.perf_counter()
         try:
             resp_text = self.llm.complete_chat(messages, max_tokens=2000)
             parsed = _parse_agent_json(resp_text)
@@ -1637,6 +1732,9 @@ class RetrievalAgent:
             "timestamp": time.time(),
             "event": "forced_answer",
             "answer": answer,
+            "llm_elapsed_s": round(
+                time.perf_counter() - forced_llm_started, 6
+            ),
         })
 
         return {

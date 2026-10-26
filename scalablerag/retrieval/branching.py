@@ -30,6 +30,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from .tiered_filter import FilterBudgetExceeded, TieredRegexFilter
+
 if TYPE_CHECKING:
     from .tools import ToolContext
 
@@ -51,18 +53,39 @@ def preview_apply_filter(ctx: "ToolContext", pattern: str, target_set: str) -> d
         target_ids = ctx.sets.resolve_ids(target_set)
     except KeyError as e:
         return {"error": str(e), "count": -1}
+    if ctx.use_tiered_filters and ctx.lexical_index is not None:
+        try:
+            decision = TieredRegexFilter(
+                ctx.doc_store, ctx.lexical_index, ctx.tier_filter_config
+            ).apply(pattern, target_ids)
+        except FilterBudgetExceeded as exc:
+            return {"error": str(exc), "count": -1, "total": len(target_ids)}
+        return {
+            "count": len(decision.positive_ids),
+            "total": len(target_ids),
+            "samples": [],
+        }
+
     hits = 0
     sample_fnames: list[str] = []
-    for did in target_ids:
-        try:
-            text = ctx.doc_store.get_text(did)
-            if compiled.search(text):
-                hits += 1
-                if len(sample_fnames) < 3:
-                    meta = ctx.doc_store.get_meta(did)
-                    sample_fnames.append(meta.filename)
-        except KeyError:
-            pass
+    if hasattr(ctx.doc_store, "iter_normalized_texts"):
+        rows = ctx.doc_store.iter_normalized_texts(target_ids)
+    elif hasattr(ctx.doc_store, "iter_texts"):
+        rows = ctx.doc_store.iter_texts(target_ids)
+    else:
+        def _rows():
+            for doc_id in target_ids:
+                try:
+                    yield doc_id, ctx.doc_store.get_text(doc_id)
+                except KeyError:
+                    pass
+        rows = _rows()
+    for did, text in rows:
+        if compiled.search(text):
+            hits += 1
+            if len(sample_fnames) < 3:
+                meta = ctx.doc_store.get_meta(did)
+                sample_fnames.append(meta.filename)
 
     return {
         "count": hits,
@@ -80,20 +103,31 @@ def preview_search_filenames(ctx: "ToolContext", pattern: str,
 
     hits = 0
     sample_fnames: list[str] = []
+    rows = None
+    if ctx.use_tiered_filters and ctx.lexical_index is not None and hasattr(ctx.lexical_index, "search_filenames"):
+        terms = ([pattern.replace("_", " ")] if not use_regex else
+                 re.findall(r"[^\W_]{3,}", pattern, re.UNICODE)[:6])
+        if terms:
+            found = ctx.lexical_index.search_filenames(terms)
+            if not found.truncated:
+                rows = []
+                for did in found.doc_ids:
+                    try: rows.append((did, ctx.doc_store.get_meta(did)))
+                    except KeyError: pass
 
     if use_regex:
         try:
             compiled = re.compile(pattern, re.IGNORECASE)
         except re.error:
             return {"error": f"invalid regex: {pattern}", "count": -1}
-        for did, meta in ctx.doc_store.iter_docs():
+        for did, meta in (rows if rows is not None else ctx.doc_store.iter_docs()):
             if compiled.search(meta.filename):
                 hits += 1
                 if len(sample_fnames) < 3:
                     sample_fnames.append(meta.filename)
     else:
         pat_lower = pattern.lower()
-        for did, meta in ctx.doc_store.iter_docs():
+        for did, meta in (rows if rows is not None else ctx.doc_store.iter_docs()):
             if pat_lower in meta.filename.lower():
                 hits += 1
                 if len(sample_fnames) < 3:

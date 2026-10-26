@@ -32,6 +32,7 @@ import numpy as np
 from ..llm.base import BaseLLM
 from ..storage.doc_store import DocStore
 from ..storage.embedding_store import EmbeddingStore
+from ..storage.lexical_index import LexicalIndex
 from .doc_sets import DocSetRegistry
 from .classifier import ClassifierStore
 from .alternatives import generate_alternatives
@@ -47,31 +48,19 @@ from .regex_safe import (
     search_multi,
     validate_user_pattern,
 )
+from .text_normalization import normalize_for_regex as _normalize_for_regex
+from .tiered_filter import (
+    FilterBudgetExceeded,
+    TieredFilterConfig,
+    TieredRegexFilter,
+    literal_alternation_terms,
+)
 
 
 
 def _unicode_tokens(text: str, min_len: int = 2) -> list[str]:
     """Tokenize text into lowercase word tokens (Unicode-aware)."""
     return [w for w in re.findall(r"\w+", text.lower(), re.UNICODE) if len(w) >= min_len]
-
-
-def _normalize_for_regex(text: str) -> str:
-    """Collapse single newlines within paragraphs into spaces.
-
-    Regex patterns need to match across adjacent lines within the
-    same section (paragraph), but must NOT match across section
-    boundaries.  This normalization collapses lines within the same
-    paragraph so that ``.`` can span them, while preserving paragraph
-    breaks (blank lines) as boundaries.
-
-    Also collapses runs of whitespace (tabs, multiple spaces from
-    joining lines with trailing spaces) into a single space so that
-    simple regex like ``limitation of liability`` matches even when
-    the original text had ``LIMITATION \\nOF LIABILITY``.
-    """
-    paragraphs = re.split(r"\n\s*\n", text)
-    collapsed = [re.sub(r"[ \t]+", " ", " ".join(p.split("\n"))) for p in paragraphs]
-    return "\n\n".join(collapsed)
 
 
 def _match_context(text: str, pattern: "re.Pattern | None",
@@ -123,6 +112,11 @@ class ToolContext:
         disabled_tools: frozenset[str] | None = None,
         extraction_index: Any = None,
         use_agg_tools: bool = False,
+        lexical_index: LexicalIndex | None = None,
+        use_tiered_filters: bool = False,
+        tier_max_bytes: int = 10_000_000,
+        tier_max_docs: int = 1_000,
+        tier_max_results: int = 16_384,
     ):
         self.llm = llm
         self.doc_store = doc_store
@@ -134,6 +128,13 @@ class ToolContext:
         self.disabled_tools = disabled_tools or frozenset()
         self.extraction_index = extraction_index
         self.use_agg_tools = use_agg_tools
+        self.lexical_index = lexical_index
+        self.use_tiered_filters = use_tiered_filters
+        self.tier_filter_config = TieredFilterConfig(
+            max_regex_bytes=tier_max_bytes,
+            max_regex_docs=tier_max_docs,
+            max_index_results=tier_max_results,
+        )
         self.user_question: str = ""
         self.question_entities: list[str] = []
         self.keyword_doc_sets: dict[str, set[str]] = {}
@@ -181,6 +182,26 @@ class ToolContext:
         """
         call_budget = min(self._target_chars // 6, self.max_tool_result_chars)
         return max(2000, call_budget // max(1, n_docs))
+
+    def regex_scan_refusal(
+        self, doc_ids: list[str], operation: str
+    ) -> str | None:
+        """Explain why an exact runtime regex scan is disallowed, if it is."""
+        if not self.use_tiered_filters:
+            return None
+        byte_count = self.doc_store.set_byte_size(doc_ids)
+        if (
+            len(doc_ids) <= self.tier_filter_config.max_regex_docs
+            and byte_count <= self.tier_filter_config.max_regex_bytes
+        ):
+            return None
+        return (
+            f"{operation} refused on {len(doc_ids)} documents / "
+            f"{byte_count / 1e6:.1f} MB. Limited-Ingestion permits full regex "
+            "only after the active set is small. Narrow it first with an "
+            "indexed literal apply_filter query, filename metadata, embeddings, "
+            "or a precomputed pattern."
+        )
 
     # ------------------------------------------------------------------
     # Auto-attach short content snippets from sets (no LLM calls).
@@ -1768,6 +1789,7 @@ def tool_apply_filter(ctx: ToolContext, args: dict) -> str:
     positive_ids: list[str] = []
     negative_ids: list[str] = []
     compiled_re: re.Pattern | None = None
+    tiered_decision = None
 
     if filter_type == "classifier":
         if not filter_id or filter_id not in ctx.classifiers._classifiers:
@@ -1804,33 +1826,80 @@ def tool_apply_filter(ctx: ToolContext, args: dict) -> str:
             )
 
         try:
-            compile_user_pattern(pattern, re.IGNORECASE)
+            safe_compiled = compile_user_pattern(pattern, re.IGNORECASE)
         except RegexSafetyError as exc:
             return format_safety_error(exc)
 
-        doc_texts: list[str] = []
-        scanned_ids: list[str] = []
-        for did in target_ids:
-            try:
-                doc_texts.append(
-                    _normalize_for_regex(ctx.doc_store.get_text(did))
+        if ctx.use_tiered_filters:
+            if ctx.lexical_index is None:
+                return (
+                    "Error: tiered filtering requires a lexical index. "
+                    "Re-run ingestion with --lexical-index."
                 )
-                scanned_ids.append(did)
-            except KeyError:
-                negative_ids.append(did)
+            policy = TieredRegexFilter(
+                ctx.doc_store, ctx.lexical_index, ctx.tier_filter_config
+            )
+            try:
+                tiered_decision = policy.apply(pattern, target_ids)
+            except FilterBudgetExceeded as exc:
+                return f"Filter refused: {exc}"
+            except RegexTimeoutError as exc:
+                return str(exc)
+            positive_ids.extend(tiered_decision.positive_ids)
+            if tiered_decision.negative_ids is not None:
+                negative_ids.extend(tiered_decision.negative_ids)
+        else:
+            rows_are_normalized = hasattr(ctx.doc_store, "iter_normalized_texts")
 
-        try:
-            hits = search_many(pattern, re.IGNORECASE, doc_texts)
-        except RegexTimeoutError as exc:
-            return str(exc)
+            def _text_rows():
+                if rows_are_normalized:
+                    yield from ctx.doc_store.iter_normalized_texts(target_ids)
+                    return
+                if hasattr(ctx.doc_store, "iter_texts"):
+                    yield from ctx.doc_store.iter_texts(target_ids)
+                    return
+                for did in target_ids:
+                    try:
+                        yield did, ctx.doc_store.get_text(did)
+                    except KeyError:
+                        negative_ids.append(did)
 
-        for did, hit in zip(scanned_ids, hits):
-            if hit:
-                positive_ids.append(did)
-            else:
-                negative_ids.append(did)
+            batch_ids: list[str] = []
+            batch_texts: list[str] = []
 
-        compiled_re = re.compile(pattern, re.IGNORECASE)
+            def _scan_batch() -> str | None:
+                if not batch_ids:
+                    return None
+                # Literal alternations cannot catastrophically backtrack.
+                # Scan them directly so the Zero baseline measures corpus
+                # search rather than serializing every batch to a subprocess.
+                if literal_alternation_terms(pattern) is not None:
+                    hits = [safe_compiled.search(text) is not None for text in batch_texts]
+                else:
+                    try:
+                        hits = search_many(pattern, re.IGNORECASE, batch_texts)
+                    except RegexTimeoutError as exc:
+                        return str(exc)
+                for did, hit in zip(batch_ids, hits):
+                    (positive_ids if hit else negative_ids).append(did)
+                batch_ids.clear()
+                batch_texts.clear()
+                return None
+
+            for did, text in _text_rows():
+                batch_ids.append(did)
+                batch_texts.append(
+                    text if rows_are_normalized else _normalize_for_regex(text)
+                )
+                if len(batch_ids) >= 10_000:
+                    error = _scan_batch()
+                    if error:
+                        return error
+            error = _scan_batch()
+            if error:
+                return error
+
+        compiled_re = safe_compiled
     else:
         return f"Error: filter_type must be 'classifier' or 'regex', got {filter_type!r}."
 
@@ -1843,12 +1912,24 @@ def tool_apply_filter(ctx: ToolContext, args: dict) -> str:
         description=f"Docs matching {filter_id}",
         filter_regex=regex_prov,
     )
-    ctx.sets.register(
-        neg_name, negative_ids,
-        source=f"{filter_type}:{filter_id}",
-        description=f"Docs not matching {filter_id}",
-        filter_regex=regex_prov,
+    lazy_negative = bool(
+        tiered_decision is not None
+        and tiered_decision.negative_ids is None
     )
+    if lazy_negative:
+        ctx.sets.register_complement(
+            neg_name, target_set, positive_ids,
+            source=f"{filter_type}:{filter_id}",
+            description=f"Docs not matching {filter_id}",
+            filter_regex=regex_prov,
+        )
+    else:
+        ctx.sets.register(
+            neg_name, negative_ids,
+            source=f"{filter_type}:{filter_id}",
+            description=f"Docs not matching {filter_id}",
+            filter_regex=regex_prov,
+        )
 
     sample_n = ctx.sample_count
 
@@ -1878,11 +1959,23 @@ def tool_apply_filter(ctx: ToolContext, args: dict) -> str:
         "positive_set": pos_name,
         "positive_count": len(positive_ids),
         "negative_set": neg_name,
-        "negative_count": len(negative_ids),
+        "negative_count": (
+            len(target_ids) - len(positive_ids)
+            if lazy_negative else len(negative_ids)
+        ),
         "total_filtered": len(target_ids),
         "sample_positive_docs": _diverse_samples(positive_ids),
         "sample_negative_docs": _diverse_samples(negative_ids),
     }
+    if tiered_decision is not None:
+        result["filter_execution"] = {
+            "mode": tiered_decision.mode,
+            "exact": tiered_decision.exact,
+            "note": tiered_decision.note,
+            "target_docs": tiered_decision.target_docs,
+            "target_bytes": tiered_decision.target_bytes,
+            "candidate_docs": tiered_decision.candidate_docs,
+        }
 
     if len(positive_ids) == 0:
         hint = (
@@ -1897,13 +1990,26 @@ def tool_apply_filter(ctx: ToolContext, args: dict) -> str:
             hint += "."
         result["zero_result_hint"] = hint
 
-    if filter_type == "regex" and compiled_re and len(positive_ids) > 0:
-        fn_match_count = sum(
-            1 for did in target_ids
-            if compiled_re.search(
-                ctx.doc_store.get_meta(did).filename
+    # This is only an advisory diagnostic.  Never turn it into a second
+    # corpus-wide scan at scale: filename search is not part of the filter's
+    # semantics, and the diagnostic otherwise dominates indexed retrieval.
+    if (
+        filter_type == "regex"
+        and compiled_re
+        and len(positive_ids) > 0
+        and len(target_ids) <= 100_000
+    ):
+        if hasattr(ctx.doc_store, "count_filename_matches"):
+            fn_match_count = ctx.doc_store.count_filename_matches(
+                pattern, target_ids
             )
-        )
+        else:
+            fn_match_count = sum(
+                1 for did in target_ids
+                if compiled_re.search(
+                    ctx.doc_store.get_meta(did).filename
+                )
+            )
         if fn_match_count != len(positive_ids):
             result["scope_check"] = (
                 f"apply_filter searches DOCUMENT TEXT. "
@@ -1945,7 +2051,11 @@ def tool_apply_filter(ctx: ToolContext, args: dict) -> str:
     # each individual keyword matches.  This is pure information — no
     # threshold gate — and lets the agent see the selectivity landscape
     # of its pattern at every step.
-    if filter_type == "regex" and target_ids:
+    if (
+        filter_type == "regex"
+        and target_ids
+        and not (tiered_decision and tiered_decision.target_was_large)
+    ):
         keywords = list(dict.fromkeys(
             re.findall(r'[^\W_]{4,}', pattern, re.UNICODE)))
         if len(keywords) >= 2:
@@ -2023,7 +2133,11 @@ def tool_apply_filter(ctx: ToolContext, args: dict) -> str:
 
     # Two entity-aware diagnostics using pre-computed keyword doc sets:
     target_set_ids = set(target_ids)
-    if ctx.question_entities and ctx.keyword_doc_sets:
+    if (
+        ctx.question_entities
+        and ctx.keyword_doc_sets
+        and not (tiered_decision and tiered_decision.target_was_large)
+    ):
         entity = ctx.question_entities[0]
         entity_docs = ctx.keyword_doc_sets.get(entity, set())
 
@@ -2252,6 +2366,29 @@ def tool_search_filenames(ctx: ToolContext, args: dict) -> str:
         target_ids = set(resolved)
 
     matches: list[dict] = []
+    indexed_ids: list[str] | None = None
+    if ctx.use_tiered_filters and ctx.lexical_index is not None and hasattr(ctx.lexical_index, "search_filenames"):
+        terms = ([pattern.replace("_", " ")] if not use_regex else
+                 re.findall(r"[^\W_]{3,}", pattern, re.UNICODE)[:6])
+        if not terms:
+            return "Filename regex refused on a large set: narrow first or include a literal keyword."
+        candidates = ctx.lexical_index.search_filenames(terms)
+        if candidates.truncated:
+            return "Filename search matched too many indexed candidates; add a more selective keyword."
+        indexed_ids = candidates.doc_ids
+        if target_ids is not None:
+            indexed_ids = [did for did in indexed_ids if did in target_ids]
+
+    def _candidate_rows():
+        if indexed_ids is None:
+            yield from ctx.doc_store.iter_docs()
+        else:
+            for did in indexed_ids:
+                try:
+                    yield did, ctx.doc_store.get_meta(did)
+                except KeyError:
+                    pass
+
     if use_regex:
         try:
             compile_user_pattern(pattern, re.IGNORECASE)
@@ -2259,7 +2396,7 @@ def tool_search_filenames(ctx: ToolContext, args: dict) -> str:
             return format_safety_error(exc)
 
         candidate_rows: list[tuple[str, Any]] = []
-        for did, meta in ctx.doc_store.iter_docs():
+        for did, meta in _candidate_rows():
             if target_ids is not None and did not in target_ids:
                 continue
             candidate_rows.append((did, meta))
@@ -2280,7 +2417,7 @@ def tool_search_filenames(ctx: ToolContext, args: dict) -> str:
                 )
     else:
         pat_lower = pattern.lower()
-        for did, meta in ctx.doc_store.iter_docs():
+        for did, meta in _candidate_rows():
             if target_ids is not None and did not in target_ids:
                 continue
             if pat_lower in meta.filename.lower():
@@ -2660,6 +2797,10 @@ def tool_explore_patterns(ctx: ToolContext, args: dict) -> str:
     if not target_ids:
         return f"Error: target set {target_set!r} is empty."
 
+    refusal = ctx.regex_scan_refusal(target_ids, "Pattern exploration")
+    if refusal:
+        return f"Filter refused: {refusal}"
+
     total = len(target_ids)
 
     # Simpler keyword patterns derived from the agent's regex list.
@@ -2929,7 +3070,9 @@ def tool_pattern_search(ctx: ToolContext, args: dict) -> str:
 
             if kw_docs is not None:
                 gap_ids = sorted((kw_docs & pattern_candidates) - matched_set)
-            else:
+            elif ctx.regex_scan_refusal(
+                sorted(pattern_candidates), "Runtime pattern-gap analysis"
+            ) is None:
                 gap_ids = []
                 for doc_id in sorted(pattern_candidates):
                     if doc_id in matched_set:
@@ -2940,6 +3083,10 @@ def tool_pattern_search(ctx: ToolContext, args: dict) -> str:
                             gap_ids.append(doc_id)
                     except KeyError:
                         pass
+            else:
+                # The indexed pattern result remains valid. Omit the optional
+                # coverage diagnostic rather than falling back to a corpus scan.
+                gap_ids = []
 
             coverage = {
                 "confirmed_in_capture": len(matched_ids),
@@ -3053,6 +3200,10 @@ def tool_extract_field(ctx: ToolContext, args: dict) -> str:
         doc_ids = ctx.sets.resolve_ids(target_set)
     except KeyError as e:
         return str(e)
+
+    refusal = ctx.regex_scan_refusal(doc_ids, "Field extraction")
+    if refusal:
+        return f"Filter refused: {refusal}"
 
     if as_type not in ("number", "text", "date"):
         return "Error: 'as_type' must be one of: number, text, date."
@@ -3172,6 +3323,10 @@ def tool_extract_list(ctx: ToolContext, args: dict) -> str:
         doc_ids = ctx.sets.resolve_ids(target_set)
     except KeyError as e:
         return str(e)
+
+    refusal = ctx.regex_scan_refusal(doc_ids, "List extraction")
+    if refusal:
+        return f"Filter refused: {refusal}"
 
     doc_texts: list[str] = []
     scanned_doc_ids: list[str] = []

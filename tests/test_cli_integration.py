@@ -26,28 +26,31 @@ from scalablerag.run_config import detect_explicit_flags, resolve_run_config
 def _eval_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--regime", choices=["zero", "limited"], default=None)
-    p.add_argument("--embeddings", action=argparse.BooleanOptionalAction)
+    p.add_argument("--with-embeddings", action="store_true")
     p.add_argument("--discover-patterns", action=argparse.BooleanOptionalAction)
     p.add_argument("--curate-patterns", action=argparse.BooleanOptionalAction)
     p.add_argument("--agg-tools", action=argparse.BooleanOptionalAction)
     p.add_argument("--branch-select", action=argparse.BooleanOptionalAction)
+    p.add_argument("--tiered-filters", action=argparse.BooleanOptionalAction)
     return p
 
 
 class CliIntegrationTests(unittest.TestCase):
-    def test_limited_with_no_embeddings_override(self):
-        argv = [
-            "eval.py",
-            "--regime",
-            "limited",
-            "--no-embeddings",
-            "--no-discover-patterns",
-        ]
+    def test_limited_defaults_without_embeddings(self):
+        argv = ["eval.py", "--regime", "limited", "--no-discover-patterns"]
         args = _eval_parser().parse_args(argv[1:])
         cfg = resolve_run_config(args, detect_explicit_flags(argv))
         self.assertTrue(cfg.skip_embeddings)
         self.assertFalse(cfg.discover_patterns)
         self.assertFalse(cfg.require_embeddings)
+        self.assertTrue(cfg.use_tiered_filters)
+
+    def test_limited_with_embeddings_flag(self):
+        argv = ["eval.py", "--regime", "limited", "--with-embeddings"]
+        args = _eval_parser().parse_args(argv[1:])
+        cfg = resolve_run_config(args, detect_explicit_flags(argv))
+        self.assertFalse(cfg.skip_embeddings)
+        self.assertTrue(cfg.require_embeddings)
 
     def test_zero_regime_via_parser(self):
         argv = ["eval.py", "--regime", "zero"]
@@ -55,13 +58,7 @@ class CliIntegrationTests(unittest.TestCase):
         cfg = resolve_run_config(args, detect_explicit_flags(argv))
         self.assertTrue(cfg.skip_embeddings)
         self.assertTrue(cfg.branch_select)
-
-    def test_explicit_embeddings_flag(self):
-        argv = ["eval.py", "--embeddings"]
-        args = _eval_parser().parse_args(argv[1:])
-        cfg = resolve_run_config(args, detect_explicit_flags(argv))
-        self.assertFalse(cfg.skip_embeddings)
-        self.assertTrue(cfg.require_embeddings)
+        self.assertFalse(cfg.use_tiered_filters)
 
 
 class JudgeCliTests(unittest.TestCase):
@@ -78,21 +75,17 @@ class JudgeCliTests(unittest.TestCase):
 
 
 class IngestFlagTests(unittest.TestCase):
-    def test_ingest_embeddings_default_on(self):
+    def test_ingest_embeddings_off_by_default(self):
         p = argparse.ArgumentParser()
-        p.add_argument(
-            "--embeddings", action=argparse.BooleanOptionalAction, default=True
-        )
+        p.add_argument("--with-embeddings", action="store_true")
         args = p.parse_args([])
-        self.assertTrue(args.embeddings)
+        self.assertFalse(args.with_embeddings)
 
-    def test_ingest_no_embeddings(self):
+    def test_ingest_with_embeddings(self):
         p = argparse.ArgumentParser()
-        p.add_argument(
-            "--embeddings", action=argparse.BooleanOptionalAction, default=True
-        )
-        args = p.parse_args(["--no-embeddings"])
-        self.assertFalse(args.embeddings)
+        p.add_argument("--with-embeddings", action="store_true")
+        args = p.parse_args(["--with-embeddings"])
+        self.assertTrue(args.with_embeddings)
 
 
 if __name__ == "__main__":

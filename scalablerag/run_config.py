@@ -23,6 +23,8 @@ from typing import Any
 
 from scalablerag.llm.factory import make_embedder
 from scalablerag.storage.embedding_store import EmbeddingStore
+from scalablerag.storage.doc_store import DocStore
+from scalablerag.storage.lexical_index import LexicalIndex
 
 
 REGIME_PRESETS: dict[str, dict[str, Any]] = {
@@ -33,34 +35,41 @@ REGIME_PRESETS: dict[str, dict[str, Any]] = {
         "use_agg_tools": True,
         "branch_select": True,
         "require_embeddings": False,
+        "use_tiered_filters": False,
+        "require_lexical_index": False,
     },
     "limited": {
-        "skip_embeddings": False,
+        "skip_embeddings": True,
         "discover_patterns": True,
         "curate_patterns": True,
         "use_agg_tools": True,
         "branch_select": True,
-        "require_embeddings": True,
+        "require_embeddings": False,
+        "use_tiered_filters": True,
+        "require_lexical_index": True,
         "embed_provider": "openai",
         "embed_model": "text-embedding-3-small",
     },
 }
 
 DEFAULT_RUN = {
-    "skip_embeddings": False,
+    "skip_embeddings": True,
     "discover_patterns": False,
     "curate_patterns": False,
     "use_agg_tools": True,
     "branch_select": True,
     "require_embeddings": False,
+    "use_tiered_filters": False,
+    "require_lexical_index": False,
 }
 
 CLI_FLAG_GROUPS: dict[str, tuple[str, ...]] = {
-    "embeddings": ("--embeddings", "--no-embeddings"),
+    "with_embeddings": ("--with-embeddings",),
     "discover_patterns": ("--discover-patterns", "--no-discover-patterns"),
     "curate_patterns": ("--curate-patterns", "--no-curate-patterns"),
     "agg_tools": ("--agg-tools", "--no-agg-tools"),
     "branch_select": ("--branch-select", "--no-branch-select"),
+    "tiered_filters": ("--tiered-filters", "--no-tiered-filters"),
 }
 
 
@@ -85,6 +94,11 @@ class ResolvedRunConfig:
     embed_provider: str | None
     embed_model: str | None
     embed_dir: str
+    use_tiered_filters: bool
+    require_lexical_index: bool
+    tier_max_bytes: int
+    tier_max_docs: int
+    tier_max_results: int
 
 
 def load_embedding_setup(
@@ -105,6 +119,25 @@ def load_embedding_setup(
     return embedding_store, embedder, embedding_store is not None
 
 
+def load_lexical_setup(
+    store_path: Path,
+    doc_store: DocStore,
+    *,
+    required: bool,
+) -> LexicalIndex | None:
+    """Load and validate the portable lexical index for a corpus."""
+    index = LexicalIndex.for_store(store_path)
+    if not index.exists():
+        if required:
+            raise FileNotFoundError(
+                f"Lexical index not found at {index.path}; re-run ingestion "
+                "with --lexical-index."
+            )
+        return None
+    index.validate(doc_store)
+    return index
+
+
 def _env_bool(name: str) -> bool | None:
     raw = os.environ.get(name, "").strip().lower()
     if raw in {"1", "true", "yes", "on"}:
@@ -112,6 +145,11 @@ def _env_bool(name: str) -> bool | None:
     if raw in {"0", "false", "no", "off"}:
         return False
     return None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw else default
 
 
 def resolve_run_config(
@@ -124,12 +162,12 @@ def resolve_run_config(
     base = dict(DEFAULT_RUN)
     base.update(preset)
 
-    if "embeddings" in explicit:
-        skip_embeddings = not bool(getattr(args, "embeddings", True))
-    elif _env_bool("SR_NO_EMBEDDINGS") is True:
-        skip_embeddings = True
+    if "with_embeddings" in explicit:
+        skip_embeddings = not bool(getattr(args, "with_embeddings", False))
+    elif _env_bool("SR_WITH_EMBEDDINGS") is True:
+        skip_embeddings = False
     else:
-        skip_embeddings = bool(base.get("skip_embeddings", False))
+        skip_embeddings = bool(base.get("skip_embeddings", True))
 
     def _resolve_bool(group: str, attr: str, preset_key: str, env_key: str) -> bool:
         if group in explicit:
@@ -149,18 +187,41 @@ def resolve_run_config(
     branch = _resolve_bool(
         "branch_select", "branch_select", "branch_select", "SR_BRANCH_SELECT"
     )
+    tiered = _resolve_bool(
+        "tiered_filters",
+        "tiered_filters",
+        "use_tiered_filters",
+        "SR_TIERED_FILTERS",
+    )
 
     require_emb = bool(base.get("require_embeddings", False))
-    if _env_bool("SR_REQUIRE_EMBEDDINGS") is True:
+    if _env_bool("SR_WITH_EMBEDDINGS") is True:
         require_emb = True
-    if "embeddings" in explicit and bool(getattr(args, "embeddings", False)):
+    if "with_embeddings" in explicit and bool(getattr(args, "with_embeddings", False)):
         require_emb = True
     if skip_embeddings:
         require_emb = False
 
+    # Tiered filtering cannot operate safely without its large-set index.
+    # Keep this invariant even when the feature is enabled explicitly rather
+    # than through the Limited-Ingestion preset.
+    require_lexical = tiered
+
     embed_provider = getattr(args, "embed_provider", None) or base.get("embed_provider")
     embed_model = getattr(args, "embed_model", None) or base.get("embed_model")
     embed_dir = getattr(args, "embed_dir", None) or os.environ.get("SR_EMBED_DIR", "")
+    tier_max_bytes = int(
+        getattr(args, "tier_max_bytes", None)
+        or _env_int("SR_TIER_MAX_BYTES", 10_000_000)
+    )
+    tier_max_docs = int(
+        getattr(args, "tier_max_docs", None)
+        or _env_int("SR_TIER_MAX_DOCS", 1_000)
+    )
+    tier_max_results = int(
+        getattr(args, "tier_max_results", None)
+        or _env_int("SR_TIER_MAX_RESULTS", 16_384)
+    )
 
     return ResolvedRunConfig(
         regime=getattr(args, "regime", None),
@@ -173,4 +234,9 @@ def resolve_run_config(
         embed_provider=embed_provider,
         embed_model=embed_model,
         embed_dir=embed_dir or "",
+        use_tiered_filters=tiered,
+        require_lexical_index=require_lexical,
+        tier_max_bytes=tier_max_bytes,
+        tier_max_docs=tier_max_docs,
+        tier_max_results=tier_max_results,
     )

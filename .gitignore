@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated experiment artifacts are reproducible and can be many GB.
+data/
+results/

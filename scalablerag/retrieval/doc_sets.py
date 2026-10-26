@@ -29,10 +29,13 @@ class DocSet:
     """A named set of document IDs with provenance."""
 
     name: str
-    doc_ids: list[str]
+    doc_ids: list[str] | None
     source: str = ""
     description: str = ""
     filter_regex: str = ""
+    complement_of: str = ""
+    excluded_ids: set[str] | None = None
+    known_count: int | None = None
 
 
 class DocSetRegistry:
@@ -43,11 +46,11 @@ class DocSetRegistry:
     """
 
     def __init__(self, all_doc_ids: list[str]):
-        self._all_ids = list(all_doc_ids)
+        self._all_ids = all_doc_ids
         self._sets: dict[str, DocSet] = {
             "all": DocSet(
                 name="all",
-                doc_ids=list(all_doc_ids),
+                doc_ids=all_doc_ids,
                 source="corpus",
                 description="All documents in the corpus",
             )
@@ -64,6 +67,30 @@ class DocSetRegistry:
         ds = DocSet(
             name=name, doc_ids=list(doc_ids), source=source,
             description=description, filter_regex=filter_regex,
+        )
+        self._sets[name] = ds
+        return ds
+
+    def register_complement(
+        self,
+        name: str,
+        base_name: str,
+        excluded_ids: list[str],
+        *,
+        source: str = "",
+        description: str = "",
+        filter_regex: str = "",
+    ) -> DocSet:
+        base_count = len(self.resolve_ids(base_name))
+        ds = DocSet(
+            name=name,
+            doc_ids=None,
+            source=source,
+            description=description,
+            filter_regex=filter_regex,
+            complement_of=base_name,
+            excluded_ids=set(excluded_ids),
+            known_count=max(0, base_count - len(set(excluded_ids))),
         )
         self._sets[name] = ds
         return ds
@@ -95,7 +122,12 @@ class DocSetRegistry:
         #
         # If the expression cannot be resolved, fall back to normal lookup.
         if set_name in self._sets:
-            return self._sets[set_name].doc_ids
+            ds = self._sets[set_name]
+            if ds.doc_ids is not None:
+                return ds.doc_ids
+            base = self.resolve_ids(ds.complement_of)
+            excluded = ds.excluded_ids or set()
+            return [doc_id for doc_id in base if doc_id not in excluded]
 
         def _try_split(op: str) -> tuple[str, str] | None:
             token = f"_{op}_"
@@ -134,7 +166,12 @@ class DocSetRegistry:
                 # If sub-expression fails, try next op / fallback.
                 pass
 
-        return self.get(set_name).doc_ids
+        ds = self.get(set_name)
+        if ds.doc_ids is not None:
+            return ds.doc_ids
+        base = self.resolve_ids(ds.complement_of)
+        excluded = ds.excluded_ids or set()
+        return [doc_id for doc_id in base if doc_id not in excluded]
 
     def intersect(self, name_a: str, name_b: str) -> list[str]:
         a = set(self.resolve_ids(name_a))
@@ -160,7 +197,10 @@ class DocSetRegistry:
         return [
             {
                 "name": ds.name,
-                "count": len(ds.doc_ids),
+                "count": (
+                    len(ds.doc_ids) if ds.doc_ids is not None
+                    else int(ds.known_count or 0)
+                ),
                 "source": ds.source,
                 "description": ds.description,
             }

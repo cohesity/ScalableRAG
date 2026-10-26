@@ -57,6 +57,8 @@ class EmbeddingStore:
         self._faiss_index = None
         self._provider: str = ""
         self._model: str = ""
+        self._doc_ids: list[str] = []
+        self._faiss_row_to_doc: dict[int, str] | None = None
         if self.store_dir.exists():
             self._load()
 
@@ -73,6 +75,7 @@ class EmbeddingStore:
         idx_path = self.store_dir / "embedding_index.json"
         if idx_path.exists():
             self._index = json.loads(idx_path.read_text())
+            self._doc_ids = list(self._index.keys())
 
         emb_path = self.store_dir / "embeddings.npy"
         if emb_path.exists():
@@ -234,6 +237,8 @@ class EmbeddingStore:
             n = chunks_per_doc[i]
             self._index[doc_id] = list(range(row, row + n))
             row += n
+        self._doc_ids = list(doc_ids)
+        self._faiss_row_to_doc = None
 
         self._build_faiss_index(emb)
         self._save_config()
@@ -311,18 +316,24 @@ class EmbeddingStore:
         # Fast path: FAISS over all docs when no candidate filter
         if self._faiss_index is not None and candidate_ids is None:
             sims, idxs = self._faiss_index.search(qv, top_k)
-            all_doc_ids = list(self._index.keys())
-            row_to_doc: dict[int, str] = {}
-            for did, rows in self._index.items():
-                for r in rows:
-                    row_to_doc[r] = did
+            direct_rows = self._k == 1 and self._count == len(self._doc_ids)
+            if not direct_rows and self._faiss_row_to_doc is None:
+                self._faiss_row_to_doc = {
+                    row: did
+                    for did, rows in self._index.items()
+                    for row in rows
+                }
 
             seen: set[str] = set()
             results: list[tuple[str, float]] = []
             for sim, idx in zip(sims[0].tolist(), idxs[0].tolist()):
                 if idx < 0:
                     continue
-                did = row_to_doc.get(idx)
+                did = (
+                    self._doc_ids[idx]
+                    if direct_rows and idx < len(self._doc_ids)
+                    else (self._faiss_row_to_doc or {}).get(idx)
+                )
                 if did and did not in seen:
                     seen.add(did)
                     results.append((did, float(sim)))
@@ -337,4 +348,4 @@ class EmbeddingStore:
         return [(search_ids[i], float(sims_arr[i])) for i in top_idx]
 
     def all_doc_ids(self) -> list[str]:
-        return list(self._index.keys())
+        return list(self._doc_ids)
