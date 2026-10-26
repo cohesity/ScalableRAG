@@ -11,13 +11,13 @@ On six QA corpora (Hotels as **Hotels-50** and **Hotels-350**), evaluated agains
 | **Limited-Ingestion ScalableRAG** | **58.91** | 86.76 | **83.50** | 75.58 | 75.57 | **73.15** | 62.44 | **73.70** |
 | **Zero-Ingestion ScalableRAG** | **58.09** | 85.74 | **82.00** | 76.31 | 78.84 | **71.74** | 55.96 | **72.67** |
 | A-RAG | 57.00 | **87.05** | 78.50 | **77.41** | 77.09 | 31.52 | 22.02 | 61.51 |
-| HippoRAG2 | 50.43 | 73.99 | 76.00 | 61.08 | **81.34** | 32.97 | 27.40 | 58.50 |
+| HippoRAG2 | 50.43 | 73.99 | 76.00 | 61.08 | **81.34** | 32.97 | 19.69 | 56.50 |
 | SRAG | 3.33 | 14.75 | 74.00 | 18.25 | 8.33 | 35.51 | 46.63 | 28.69 |
 | GraphRAG | 15.47 | 35.55 | 35.50 | 23.54 | 13.75 | 1.45 | 1.04 | 18.04 |
 | Vanilla RAG (top-100) | 38.49 | 43.80 | 71.00 | 32.09 | 77.59 | 30.80 | 13.99 | 43.97 |
 | AutoSchemaKG | — | — | — | — | 80.40 | 24.64 | 22.80 | — |
 
-Macro avg. is the **macro** GPT-4.1 judge aggregate over all seven partitions (Table 1 in the [paper](https://arxiv.org/pdf/2607.25135)). It matches the simple mean of the seven dataset columns for most systems, but not always (e.g. HippoRAG2: row mean ≈ 57.6 vs macro **58.50** in the table).
+Macro avg. is the **macro** GPT-4.1 judge aggregate over all seven partitions (Table 1 in the [paper](https://arxiv.org/pdf/2607.25135)). For the systems above it equals the unweighted mean of the seven per-dataset GPT-4.1 judge scores in each row (the table also reports a separate query-weighted aggregate in the paper).
 
 Concretely, the agent maintains a registry of named document sets and typed value sets (numbers, dates, lists, and strings). Tools create sets from regex or indexed literals, extract values, intersect and union sets, and run aggregations with parent-relative diagnostics that flag implausible narrowing. That design is what lets ScalableRAG match strong conventional QA without giving up exact corpus-level reasoning. See the [paper](https://arxiv.org/pdf/2607.25135) for the full method and ablations.
 
